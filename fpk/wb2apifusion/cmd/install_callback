@@ -1,0 +1,8 @@
+#!/bin/bash
+
+### 安装后调用。config.json 由 cmd/main 在首次启动时按向导生成，
+### 这里只准备数据目录（程序要求 auths/ 已存在，否则写账号凭据会失败）。
+
+mkdir -p ${TRIM_PKGVAR}/auths
+
+exit 0

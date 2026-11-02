@@ -1,0 +1,30 @@
+[
+  {
+    "stepTitle": "欢迎使用",
+    "items": [
+      {
+        "type": "text",
+        "field": "port",
+        "label": "端口",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入内容"
+          }
+        ],
+        "options": [],
+        "helpText": "默认面板：http://192.168.x.x:7865/（融合版面板在根路径，不在 /panel），模型地址：http://127.0.0.1:7865/v1。与 wb2api+ 共存时不要都填 7863。",
+        "initValue": "7865"
+      },
+      {
+        "type": "password",
+        "field": "pwd",
+        "label": "密码",
+        "rules": [],
+        "options": [],
+        "helpText": "面板登录密码与模型 API Key 同一个值；留空则首次启动自动生成，写在应用数据目录的 first-boot-secret.txt",
+        "initValue": ""
+      }
+    ]
+  }
+]

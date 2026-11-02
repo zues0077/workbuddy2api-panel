@@ -1,0 +1,186 @@
+#!/bin/bash
+
+### 融合版（sddvcm/workbuddy-api）在飞牛 fnOS 上的启动/停止控制。
+###
+### 与同仓库的 wb2api+（workbuddy2api-panel）不同：这个程序**只从 workDir 下的
+### config.json 取配置**，环境变量里只有 WILDWORK_HOME 会被它自己读走，其余
+### WILDWORK_* 是官方容器 entrypoint.sh 用来现生成 config.json 的中间量。
+### 所以安装脚本必须在拉起进程前把 config.json 落盘，否则向导里填的端口和密码
+### 会被静默忽略（现象是程序按 :7863 + 随机 key 起来了）。
+
+LISTEN_PORT="${port:-7865}"
+WIZ_PWD="${pwd:-}"
+
+CFG_DIR="${TRIM_PKGVAR}"
+CFG_FILE="${TRIM_PKGVAR}/config.json"
+AUTH_DIR="${TRIM_PKGVAR}/auths"
+STATE_FILE="${TRIM_PKGVAR}/state.json"
+SECRET_FILE="${TRIM_PKGVAR}/first-boot-secret.txt"
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+BIN="${TRIM_APPDEST}/bin/workbuddy-api"
+
+export WILDWORK_HOME="${CFG_DIR}"
+export WILDWORK_LISTEN=":${LISTEN_PORT}"
+export WILDWORK_REGION="cn"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
+}
+
+# json_escape：转义 \ 和 "，并吃掉换行。
+# 向导密码含引号时若不转义，生成的 config.json 直接非法，程序启动即崩。
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n\t'
+}
+
+# resolve_secret：面板登录密码 = API Key（与 wb2api+ 的习惯保持一致）。
+# 监听 :${LISTEN_PORT} 属于对外暴露，而这个程序在「对外监听 + 无管理密码」时
+# **拒绝启动**，所以向导留空时必须自己造一个稳定值并留在包里可查。
+resolve_secret() {
+    if [ -n "$WIZ_PWD" ]; then
+        SECRET="$WIZ_PWD"
+        return 0
+    fi
+    if [ -f "$SECRET_FILE" ]; then
+        SECRET=$(head -n 1 "$SECRET_FILE" | tr -d '[:space:]')
+        [ -n "$SECRET" ] && return 0
+    fi
+    SECRET=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
+    printf '%s\n' "$SECRET" > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    log_msg "向导未填密码，已生成随机密码并写入 ${SECRET_FILE}"
+    return 0
+}
+
+# patch_top_level <key> <value>：只改缩进两格的那一行 —— 程序的 config.json
+# 由 MarshalIndent 写出（顶层字段恰好两格缩进），嵌套的同名字段（渠道里的
+# api_key）不能被动。找不到就在起始花括号后补一行。
+patch_top_level() {
+    key="$1"
+    value="$2"
+    line="  \"${key}\": \"${value}\","
+    if grep -q "^  \"${key}\":" "$CFG_FILE"; then
+        sed -i "s|^  \"${key}\": .*|${line}|" "$CFG_FILE"
+    else
+        sed -i "1a ${line}" "$CFG_FILE"
+    fi
+}
+
+write_config() {
+    mkdir -p "$CFG_DIR" "$AUTH_DIR"
+    if [ ! -f "$CFG_FILE" ]; then
+        cat > "$CFG_FILE" <<EOF
+{
+  "listen": "${WILDWORK_LISTEN}",
+  "api_key": "$(json_escape "$SECRET")",
+  "admin_password": "$(json_escape "$SECRET")",
+  "auth_dir": "${AUTH_DIR}",
+  "state_file": "${STATE_FILE}",
+  "region": "${WILDWORK_REGION}"
+}
+EOF
+        log_msg "首次启动：生成 ${CFG_FILE}（listen=${WILDWORK_LISTEN}）"
+        return 0
+    fi
+    # 已存在 = 用户可能在面板里加过渠道/代理，只回写向导管理的三个字段。
+    patch_top_level "listen" "${WILDWORK_LISTEN}"
+    patch_top_level "api_key" "$(json_escape "$SECRET")"
+    patch_top_level "admin_password" "$(json_escape "$SECRET")"
+    log_msg "按向导回写 listen=${WILDWORK_LISTEN}，密码字段保持同步"
+}
+
+start_process() {
+    if pgrep -f "${BIN}" > /dev/null 2>&1; then
+        log_msg "found existing process, killing..."
+        pkill -f "${BIN}"
+        sleep 1
+    fi
+
+    resolve_secret
+    write_config
+
+    log_msg "Starting process ..."
+    # --no-tray：NAS 上没有桌面环境，带托盘会 panic（官方镜像同样这么起）。
+    bash -c "${BIN} --no-tray" 2>&1 &
+    printf "%s" "$!" > ${PID_FILE}
+    return 0
+}
+
+stop_process() {
+    log_msg "Stopping process ..."
+
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+
+        log_msg "pid=${pid}"
+        if ! check_process "${pid}"; then
+            rm -f ${PID_FILE}
+            log_msg "remove pid file 1"
+            return
+        fi
+
+        log_msg "send TERM signal to PID:${pid}..."
+        kill -TERM ${pid} >> ${LOG_FILE} 2>&1
+
+        count=0
+        while check_process "${pid}" && [ $count -lt 10 ]; do
+            sleep 1
+            count=$((count + 1))
+            log_msg "waiting process terminal... (${count}s/10s)"
+        done
+
+        if check_process "${pid}"; then
+            log_msg "send KILL signal to PID:${pid}..."
+            kill -KILL "${pid}"
+            sleep 1
+            rm -f ${PID_FILE}
+        else
+            log_msg "process killed... "
+        fi
+    fi
+
+    return 0
+}
+
+check_process() {
+    local pid=$1
+    if kill -0 "${pid}" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if check_process "${pid}"; then
+            return 0
+        else
+            rm -f ${PID_FILE}
+        fi
+    fi
+
+    return 1
+}
+
+case $1 in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

@@ -1,0 +1,385 @@
+name: fusion
+
+# 融合版产物线：把 sddvcm/workbuddy-api（多渠道聚合：WorkBuddy / Qoder / 智谱 /
+# 千问办公 / 小浣熊 / Loomy 等 12 个平台）按我们自己的流水线打成三种可用件，
+# 发到同一个 Release：
+#   - workbuddy-api-<ver>-win-amd64.exe     Windows 单文件（免解压）
+#   - wb2apifusion-<ver>-{x86,arm}.fpk      飞牛 NAS 应用包（官方 fnpack 打）
+#   - ghcr.io/<我们仓库>/fusion:<ver>        多架构容器镜像
+#
+# 为什么是「拉上游源码重新打包」而不是把渠道代码并进面板：
+# 两仓库 module path 不同（workbuddy-api vs github.com/misakano7545/workbuddy2api-panel）、
+# 面板实现也不同，git 层面合并只会产生结构性冲突；逐个渠道移植是每个 2000~4700 行的工程。
+# 所以「融合」先落到**产物级**：上游一更新，这里重跑就出新包（schedule 每天比对 commit）。
+#
+# Release tag 故意用 fusion-<版本号> 而不是 v<版本号>：
+#   1. 不撞 binaries/docker/exe/fpk 那四条 `push: tags: ["v*"]` 的流水线（它们打面板本体）；
+#   2. 面板内置 updater 的 parseVersion 只认「4 段纯数字」标签，`fusion-0.x` 恒不匹配，
+#      不会把面板的「检测到新版本」指到融合包上（指错了会下错资产）。
+#
+# 触发：schedule（发现 sddvcm 有新 commit 才动手）+ 手动指定 ref/force。
+on:
+  schedule:
+    - cron: "23 23 * * *" # 每天一次，北京 07:23（错开 upstream-watch 的 07:17）
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "sddvcm/workbuddy-api 的 ref（tag 名或分支，留空 = main）"
+        required: false
+        type: string
+      force:
+        description: "版本没变也强制重打一次"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: fusion-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  FUSION_REPO: sddvcm/workbuddy-api
+  APP_NAME: wb2apifusion
+  FNPACK_VERSION: 1.2.3
+  # 子路径镜像：GITHUB_TOKEN 的 packages:write 作用域是「本仓库命名空间」，
+  # ghcr.io/<owner>/<repo>/fusion 仍在该命名空间内，不需要额外 PAT。
+  IMAGE_NAME: ${{ github.repository }}/fusion
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.pick.outputs.upstream_sha }}
+      version: ${{ steps.pick.outputs.version }}
+      release_tag: ${{ steps.pick.outputs.release_tag }}
+      skip: ${{ steps.gate.outputs.skip }}
+    steps:
+      - name: Pick upstream commit and our version number
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.ref || 'main' }}"
+          SHA=$(gh api "repos/$FUSION_REPO/commits/$REF" --jq '.sha')
+          [[ -n "$SHA" ]] || { echo "::error::拿不到 $FUSION_REPO@$REF 的 commit"; exit 1; }
+          # 飞牛版本号只收纯数字分段：上游 tag v0.1.6 去掉 v 正好；
+          # ref 是分支时按上海时间取号，前面补 0 段，确保与面板的时间标签不同形。
+          if gh api "repos/$FUSION_REPO/git/ref/tags/$REF" --jq .ref >/dev/null 2>&1; then
+            VERSION="${REF#v}"
+          else
+            VERSION="0.$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)"
+          fi
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::版本号 $VERSION 不符合飞牛格式"; exit 1; }
+          {
+            echo "upstream_sha=$SHA"
+            echo "version=$VERSION"
+            echo "release_tag=fusion-$VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "融合版 $VERSION ← $FUSION_REPO@$REF (${SHA:0:7})"
+
+      - name: Skip if this commit is already packaged
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.pick.outputs.release_tag }}"
+          SHA="${{ steps.pick.outputs.upstream_sha }}"
+          if [[ "${{ github.event.inputs.force }}" == "true" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "手动 force，重打 $TAG"
+            exit 0
+          fi
+          # 幂等判据写在 Release 正文里（commit 链接含完整 sha），不额外维护状态文件：
+          # 少一个需要同步的持久状态，就少一种「状态说打过了但资产不见了」的扯皮。
+          BODY=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.body // ""' 2>/dev/null || true)
+          if [[ -n "$BODY" && "$BODY" == *"$SHA"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG 已经是 commit ${SHA:0:7} 的产物，无需重打"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Release 先建好：两个架构 job 会并行上传资产，谁先跑到都得有地方传。
+      - name: Create or reuse the Release
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pick.outputs.version }}
+          RELEASE_TAG: ${{ steps.pick.outputs.release_tag }}
+          UPSTREAM_SHA: ${{ steps.pick.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          NOTES="融合版（sddvcm/workbuddy-api，多渠道聚合网关）${VERSION}。
+
+          上游提交：https://github.com/${FUSION_REPO}/commit/${UPSTREAM_SHA}
+
+          - \`*.fpk\`：飞牛 NAS 应用包。面板在**根路径**（不是 /panel/），默认端口 7865，可与 wb2api+ 的 7863 在同一台 NAS 共存。
+          - \`*.exe\`：Windows 单文件，免解压；首次运行在 exe 同目录生成 config.json。
+          - 镜像：\`ghcr.io/${IMAGE_NAME}:${VERSION}\`
+
+          ⚠️ 本包由 CI 从上游源码重新打包，代码与渠道实现归 sddvcm 维护；账号风控与可用性请自行评估。"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "融合版 ${VERSION}（多渠道）" --notes "$NOTES" --latest=false
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: x86
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            platform: arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 上游 go.mod 声明 go 1.25.0；固定小版本线，避免 runner 预装版本与
+          # go.mod 不一致时去下载 toolchain（CI 里那步经常卡 3 分钟）。
+          go-version: "1.25"
+
+      - name: Fetch fusion source at the pinned commit
+        run: |
+          set -euo pipefail
+          # tarball 而不是 git clone：只要那一个 commit 的工作树。
+          # cmd/workbuddy-api/web 是 go:embed 的提交内容，tarball 与 clone 等价。
+          curl -fL --retry 3 "https://codeload.github.com/$FUSION_REPO/tar.gz/$UPSTREAM_SHA" -o src.tgz
+          mkdir -p fusion-src
+          tar -xzf src.tgz -C fusion-src --strip-components=1
+          test -f fusion-src/cmd/workbuddy-api/main.go
+          test -d fusion-src/cmd/workbuddy-api/web
+          du -sh fusion-src
+
+      - name: Build linux binary
+        run: |
+          set -euo pipefail
+          cd fusion-src
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build -trimpath -ldflags="-s -w" -o "../workbuddy-api-${VERSION}-linux-${{ matrix.arch }}" ./cmd/workbuddy-api
+          cd ..
+          file "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}"
+          sha256sum "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}"
+
+      # Windows 单文件只在一个 job 里造：交叉编译不依赖宿主架构，
+      # 两个 job 各传一遍会在 Release 上留两份同名资产的重传记录。
+      - name: Build windows exe (x86 job only)
+        if: matrix.platform == 'x86'
+        run: |
+          set -euo pipefail
+          cd fusion-src
+          # -H windowsgui 与上游 scripts/build_release.sh 一致：无控制台窗口，
+          # 托盘由程序自己按 --no-tray 判定。少了这个 flag，双击就是黑框。
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -H windowsgui" -o "workbuddy-api-${VERSION}-win-amd64.exe" ./cmd/workbuddy-api
+          cd ..
+          sha256sum "workbuddy-api-${VERSION}-win-amd64.exe"
+
+      - name: Upload linux binary & exe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}" --clobber
+          if [[ -f "workbuddy-api-${VERSION}-win-amd64.exe" ]]; then
+            gh release upload "$RELEASE_TAG" "workbuddy-api-${VERSION}-win-amd64.exe" --clobber
+          fi
+
+      - name: Stage fpk source tree
+        run: |
+          set -euo pipefail
+          rm -rf "$APP_NAME"
+          cp -r "fpk/$APP_NAME" "$APP_NAME"
+          mkdir -p "$APP_NAME/app/bin"
+          cp "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}" "$APP_NAME/app/bin/workbuddy-api"
+          chmod 755 "$APP_NAME/app/bin/workbuddy-api"
+          cp fusion-src/config.example.json "$APP_NAME/app/config.example.json"
+          chmod 755 "$APP_NAME"/cmd/*
+          find "$APP_NAME" -type f | sort
+
+      - name: Fetch fnpack
+        run: |
+          set -euo pipefail
+          SRC="https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-${{ matrix.arch }}"
+          FB="https://raw.githubusercontent.com/shuangji66/buildbot/main/fnpack/fnpack-${FNPACK_VERSION}-linux-${{ matrix.arch }}"
+          curl -fL --retry 3 "$SRC" -o fnpack || curl -fL --retry 3 "$FB" -o fnpack
+          chmod +x fnpack
+
+      - name: Fill manifest placeholders
+        run: |
+          set -euo pipefail
+          python3 - "$APP_NAME/manifest" "$VERSION" "${{ matrix.platform }}" "$UPSTREAM_SHA" <<'PY'
+          import json, sys
+          path, version, platform, sha = sys.argv[1:5]
+          changelog = f"同步 sddvcm/workbuddy-api 至 {sha[:7]}（融合版产物线，代码归上游）"
+          with open(path, encoding="utf-8") as f:
+              text = f.read()
+          text = text.replace("${VERSION}", version)
+          text = text.replace("${PLATFORM}", platform)
+          # changelog 含中文/引号，走 JSON 字符串转义，不用 sed。
+          text = text.replace("${CHANGELOG}", json.dumps(changelog, ensure_ascii=False))
+          for left in ("${VERSION}", "${PLATFORM}", "${CHANGELOG}"):
+              assert left not in text, f"占位符 {left} 未被替换"
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(text)
+          PY
+          cat "$APP_NAME/manifest"
+
+      - name: Build fpk
+        run: |
+          set -euo pipefail
+          ./fnpack build "$APP_NAME"
+          FPK=$(ls *.fpk | head -1)
+          [[ -z "$FPK" ]] && { echo "::error::fnpack 没有产出 .fpk"; exit 1; }
+          FINAL="${APP_NAME}-${VERSION}-${{ matrix.platform }}.fpk"
+          mv "$FPK" "$FINAL"
+          echo "FINAL_FPK=$FINAL" >> "$GITHUB_ENV"
+          ls -la "$FINAL"
+          sha256sum "$FINAL"
+
+      - name: Upload fpk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "$FINAL_FPK" --clobber
+
+      - name: Prepare image context
+        run: |
+          set -euo pipefail
+          # 上游 docker/Dockerfile 是「COPY workbuddy-api」的极简运行镜像：
+          # 不在容器里编译、不拉依赖，专治 NAS 上 go mod download 超时。
+          # 所以二进制必须就叫这个名字，落在 docker/ 目录里。
+          cp "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}" fusion-src/docker/workbuddy-api
+          chmod +x fusion-src/docker/entrypoint.sh
+          ls -l fusion-src/docker
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push per-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: fusion-src/docker
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            io.fusion.upstream=${{ env.FUSION_REPO }}
+            io.fusion.upstream.sha=${{ env.UPSTREAM_SHA }}
+          provenance: false
+          cache-from: type=gha,scope=fusion-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=fusion-${{ matrix.platform }}
+
+  manifest:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge per-arch images into one multi-arch tag
+        run: |
+          set -euo pipefail
+          # 一条 buildx 命令同时产两架构要 QEMU 模拟 arm64（Go 链接阶段特别慢），
+          # 所以两个 job 各推一个 -amd64 / -arm64 标签，这里只合 manifest、不重传层。
+          IMG="$REGISTRY/$IMAGE_NAME"
+          docker buildx imagetools create \
+            -t "$IMG:$VERSION" -t "$IMG:latest" \
+            "$IMG:$VERSION-amd64" "$IMG:$VERSION-arm64"
+          docker buildx imagetools inspect "$IMG:$VERSION"
+
+  # fpk 是「装到 NAS 上跑」的东西，出包后先在 runner 里真跑一次：
+  # 解包 → 按 cmd/main 的语义造 config.json → 起进程 → 打根路径与 /healthz。
+  # 这一步拦掉的是最常见的「装完起不来」（二进制架构错、config 字段名写错、
+  # 缺依赖库），而这些在飞牛界面上只会显示「启动失败」，排查成本极高。
+  smoke:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+    steps:
+      - name: Unpack the published fpk and boot it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          FPK="$APP_NAME-$VERSION-x86.fpk"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$FPK" --clobber
+          mkdir -p unpack
+          tar -xzf "$FPK" -C unpack
+          TGZ=$(find unpack -name 'app.tgz' | head -1)
+          [[ -z "$TGZ" ]] && { echo "::error::$FPK 里没有 app.tgz，fnpack 的结构变了"; exit 1; }
+          mkdir -p app
+          tar -xzf "$TGZ" -C app
+          BIN=$(find app -type f -name workbuddy-api | head -1)
+          [[ -z "$BIN" ]] && { echo "::error::app.tgz 里没有 workbuddy-api 二进制"; exit 1; }
+          chmod +x "$BIN"
+          file "$BIN"
+          MAIN=$(find app -type f -path '*/cmd/main' | head -1)
+          [[ -n "$MAIN" ]] && echo "cmd/main 随包发布：$MAIN"
+
+          PKGVAR=$(mktemp -d)
+          mkdir -p "$PKGVAR/auths"
+          # 与 cmd/main 生成的是同一份字段集（程序只认这些顶层键）。
+          # 监听写 127.0.0.1：空主机名在程序侧算「对外暴露」，会因缺管理密码拒绝启动，
+          # 而 smoke 要验的是「二进制能不能起 + 根路径有没有界面」，不是那套安全闸门。
+          cat > "$PKGVAR/config.json" <<EOF
+          {
+            "listen": "127.0.0.1:7865",
+            "api_key": "smoke-key",
+            "admin_password": "smoke-pass",
+            "auth_dir": "$PKGVAR/auths",
+            "state_file": "$PKGVAR/state.json",
+            "region": "cn"
+          }
+          EOF
+          WILDWORK_HOME="$PKGVAR" "$BIN" --no-tray > "$PKGVAR/run.log" 2>&1 &
+          RUNPID=$!
+          for _ in $(seq 1 20); do
+            sleep 1
+            curl -fsS http://127.0.0.1:7865/ >/dev/null 2>&1 && break
+          done
+          if ! kill -0 "$RUNPID" 2>/dev/null; then
+            echo "::error::进程退出，运行日志："
+            cat "$PKGVAR/run.log"
+            exit 1
+          fi
+          # 融合版面板挂在 /（面板本体挂在 /panel/），首页必须是 HTML。
+          ROOT_CODE=$(curl -fsS -o /tmp/root.html -w '%{http_code}' http://127.0.0.1:7865/)
+          grep -qiE '<html|<!doctype' /tmp/root.html
+          curl -fsS http://127.0.0.1:7865/healthz
+          echo "smoke ok：根路径 HTTP $ROOT_CODE、/healthz 通，二进制来自 $FPK"
+          kill -TERM "$RUNPID" 2>/dev/null || true
