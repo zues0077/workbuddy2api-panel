@@ -44,7 +44,20 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// 以下三个是 qodercn（Qoder 中国版，realm "qodercn"）渠道专用的 COSY 机器
+	// 指纹：MachineID=x-machine-id、MachineToken=cosy-machinetoken、
+	// MachineType=cosy-machinetype。登录后由 qodercn.EnsureFingerprint 生成一次
+	// 并随凭据落盘，跨重启稳定。WorkBuddy 账号恒为空，解析/写回对空值零痕迹。
+	MachineID    string
+	MachineToken string
+	MachineType  string
 }
+
+// RealmQoderCN qodercn（Qoder 中国版）渠道的 realm 标识。
+// 它与 cn/global 不是同一维度（cn/global 是 WorkBuddy 的区域），但沿用同一个
+// realm 通道做账号池分域与模型前缀路由（客户端请求 "qodercn/<model>"）。
+const RealmQoderCN = "qodercn"
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
@@ -121,6 +134,11 @@ func (a *Auth) Realm() string {
 // 锁内再调 Realm() 会自锁）。realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在锁内
 // 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
 func (a *Auth) realmLocked() string {
+	// qodercn 是独立渠道，不受 global 逃生门约束：SetGlobalEnabled(false) 的语义是
+	// 「锁死纯 CN 的 WorkBuddy 路由」，不是「锁死一切非 CN 账号」。
+	if strings.TrimSpace(a.realm) == RealmQoderCN {
+		return RealmQoderCN
+	}
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -175,9 +193,9 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 		return false, fmt.Errorf("nil auth")
 	}
 	switch strings.TrimSpace(realm) {
-	case "cn", "global":
+	case "cn", "global", RealmQoderCN:
 	default:
-		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
+		return false, fmt.Errorf("realm must be cn/global/qodercn, got %q", realm)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -190,6 +208,9 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
+
+// IsQoderCN 报告账号是否为 qodercn（Qoder 中国版）渠道账号。
+func (a *Auth) IsQoderCN() bool { return a.Realm() == RealmQoderCN }
 
 // IsEnterprise 报告账号是否为企业版（auth 文件带非空 enterpriseId）。
 //
@@ -369,6 +390,9 @@ func Parse(raw []byte) (*Auth, error) {
 				ExpiresAt    int64  `json:"expiresAt"`
 				Domain       string `json:"domain"`
 				Realm        string `json:"realm"`
+				MachineID    string `json:"machineId"`
+				MachineToken string `json:"machineToken"`
+				MachineType  string `json:"machineType"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -377,9 +401,26 @@ func Parse(raw []byte) (*Auth, error) {
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
+			// MachineID/MachineToken/MachineType 顶层别名（手写扁平习惯）；auth 对象内
+			// 的 machineId 等优先（qodercn 插件形落在 auth 对象里）。
+			MachineIDTop    string `json:"machineId"`
+			MachineTokenTop string `json:"machineToken"`
+			MachineTypeTop  string `json:"machineType"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+		}
+		machineID := n.Auth.MachineID
+		if machineID == "" {
+			machineID = n.MachineIDTop
+		}
+		machineToken := n.Auth.MachineToken
+		if machineToken == "" {
+			machineToken = n.MachineTokenTop
+		}
+		machineType := n.Auth.MachineType
+		if machineType == "" {
+			machineType = n.MachineTypeTop
 		}
 		a = Auth{
 			AccessToken:  n.Auth.AccessToken,
@@ -391,6 +432,9 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			MachineID:    machineID,
+			MachineToken: machineToken,
+			MachineType:  machineType,
 		}
 	} else {
 		var f struct {
@@ -403,6 +447,9 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			MachineID    string `json:"machineId"`
+			MachineToken string `json:"machineToken"`
+			MachineType  string `json:"machineType"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -417,6 +464,9 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			MachineID:    f.MachineID,
+			MachineToken: f.MachineToken,
+			MachineType:  f.MachineType,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -472,6 +522,16 @@ func (a *Auth) SaveAtomic() error {
 			"enterpriseId": a.EnterpriseID,
 			"nickname":     a.Nickname,
 		},
+	}
+	// qodercn 机器指纹：非空才写（WorkBuddy 账号不引入空键，保持插件可读形状）。
+	if a.MachineID != "" {
+		doc["auth"].(map[string]any)["machineId"] = a.MachineID
+	}
+	if a.MachineToken != "" {
+		doc["auth"].(map[string]any)["machineToken"] = a.MachineToken
+	}
+	if a.MachineType != "" {
+		doc["auth"].(map[string]any)["machineType"] = a.MachineType
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
@@ -560,6 +620,48 @@ func LoadDir(dir string) ([]*Auth, error) {
 					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
 				} else if r == "global" {
 					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
+				}
+			}
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// LoadQoderCNDir 扫描并解析 dir 下 qodercn-*.json（Qoder 中国版渠道凭据，独立前缀
+// 避免与 workbuddy*.json 互吞——qodercn 文件带 machineId 等指纹字段与 dt-/drt- token）。
+// 与 LoadDir 同一套坏文件回退 / 重复 UID 告警语义；realm 恒显式补 qodercn
+// （domain qoder.com.cn 不参与 WorkBuddy 的 cn/global 推断）。
+func LoadQoderCNDir(dir string) ([]*Auth, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "qodercn-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	seenUID := make(map[string]string, len(files))
+	var out []*Auth
+	for _, f := range files {
+		raw, err := safefile.Read(f, func(b []byte) bool {
+			_, perr := Parse(b)
+			return perr == nil
+		})
+		if err != nil {
+			log.Printf("ERROR: auth 文件 %s 无法读取: %v —— 该账号本次不在池里，修好文件或重新登录", f, err)
+			continue
+		}
+		a, err := Parse(raw)
+		if err != nil {
+			log.Printf("ERROR: auth 文件 %s 解析失败: %v —— 该账号本次不在池里", f, err)
+			continue
+		}
+		a.FilePath = f
+		if prev, ok := seenUID[a.UID]; ok {
+			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖", logfmt.Label(a.UID, a.Nickname), prev, f)
+		}
+		seenUID[a.UID] = f
+		if a.RealmStored() != RealmQoderCN {
+			if _, err := BackfillRealmFor(a, RealmQoderCN); err == nil {
+				if serr := a.SaveAtomic(); serr != nil {
+					log.Printf("WARN: auth %s realm=qodercn backfill save: %v", logfmt.Label(a.UID, a.Nickname), serr)
 				}
 			}
 		}

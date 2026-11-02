@@ -107,6 +107,11 @@ type Panel struct {
 	loginMu sync.Mutex
 	logins  map[string]loginSession
 
+	// qcnLogins 进行中的 QoderCN 设备授权会话（login_qodercn.go；与 WorkBuddy 的
+	// logins 平行，PKCE verifier/nonce 是本渠道特有状态）。
+	qcnMu     sync.Mutex
+	qcnLogins map[string]qcnLoginState
+
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
 	// 而不是并发跑两遍浪费上游请求（动作虽幂等，expert 系每遍含 8 次真实对话）。
@@ -222,6 +227,7 @@ func New(cfg Config) *Panel {
 		started: time.Now(),
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
+		qcnLogins: map[string]qcnLoginState{},
 	}
 	p.routes()
 	return p
@@ -250,6 +256,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/start", p.loginStart)
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.loginPoll)
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.loginRegions)
+	p.mux.HandleFunc("POST /panel/api/qodercn/login/start", p.qodercnLoginStart)
+	p.mux.HandleFunc("GET /panel/api/qodercn/login/poll", p.qodercnLoginPoll)
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.importCockpit)
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.addAPIKey)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.accountRevive)

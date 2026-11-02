@@ -689,7 +689,9 @@ func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if a.SupportsPersonalEndpoints() {
+		// qodercn 渠道无 WorkBuddy 活动状态端点：跳过状态查询，直接走下方
+		// DailyCheckin（bridge 已按 realm 分流到 campaigns 签到）。
+		if a.SupportsPersonalEndpoints() && !a.IsQoderCN() {
 			// 先查活动状态（只读）：本机 checkin_done 只记录我们自己发起的签到，用户从手机 /
 			// 官方客户端签过就看不到；上游 today_checked_in 才是权威事实。已签则直接记账跳过
 			// （省掉 21:00 那一轮注定被幂等拒绝的写调用），顺带把连登与活动截止落进日志；
@@ -764,6 +766,11 @@ func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		// qodercn 渠道无 growth/活跃上报体系：/v2/report 与成长任务都是 WorkBuddy
+		// 端点，对 dt- token 只会报错——与「静默无效」同类，显式跳过。
+		if a.IsQoderCN() {
 			continue
 		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是

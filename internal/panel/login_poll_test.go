@@ -47,6 +47,8 @@ const ctx = {
   loginState: 'st1',
   loginTimer: 7,
   loginStartAt: 0,
+  // app.js 顶部的轮询端点变量（随登录站点在 startAddLogin 里切换）。
+  loginPollPath: 'login/poll',
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.pollLogin = pollLogin; this.getFails = () => pollFails; this.getTimer = () => loginTimer;', ctx);

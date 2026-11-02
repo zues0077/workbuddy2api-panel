@@ -4,9 +4,9 @@ import "testing"
 
 // TestNormalizeHiddenModels 归一化语义：
 //   - nil/空/全空白 → nil（不隐藏）
-//   - 裸名 → 两域都藏（"cn:x" + "global:x"）
+//   - 裸名 → 三域都藏（"cn:x" + "global:x" + "qodercn:x"）
 //   - "cn:"/"global:" 前缀 → 只藏该域
-//   - 非 cn/global 前缀（如 "xx:yy"）视为裸名整体（与 resolveModel 对称：
+//   - 非 realm 前缀（如 "xx:yy"）视为裸名整体（与 resolveModel 对称：
 //     前缀不合法时 realm=cn、bare=原串，网关侧检查 "cn:xx:yy" 命中）
 func TestNormalizeHiddenModels(t *testing.T) {
 	if got := NormalizeHiddenModels(nil); got != nil {
@@ -20,13 +20,13 @@ func TestNormalizeHiddenModels(t *testing.T) {
 	}
 
 	got := NormalizeHiddenModels([]string{"deepseek-v3"})
-	for _, want := range []string{"cn:deepseek-v3", "global:deepseek-v3"} {
+	for _, want := range []string{"cn:deepseek-v3", "global:deepseek-v3", "qodercn:deepseek-v3"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("bare name: missing %q in %v", want, got)
 		}
 	}
-	if len(got) != 2 {
-		t.Errorf("bare name: got %d entries %v, want 2", len(got), got)
+	if len(got) != 3 {
+		t.Errorf("bare name: got %d entries %v, want 3", len(got), got)
 	}
 
 	got = NormalizeHiddenModels([]string{"cn:pro-model"})
@@ -73,13 +73,13 @@ func TestNormalizeAllowedModels(t *testing.T) {
 	if !enabled {
 		t.Fatal("非空有效条目应启用白名单")
 	}
-	for _, want := range []string{"cn:glm-5.2", "global:glm-5.2"} {
+	for _, want := range []string{"cn:glm-5.2", "global:glm-5.2", "qodercn:glm-5.2"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("裸名：缺 %q in %v", want, got)
 		}
 	}
-	if len(got) != 2 {
-		t.Errorf("裸名：得 %d 条 %v, want 2", len(got), got)
+	if len(got) != 3 {
+		t.Errorf("裸名：得 %d 条 %v, want 3", len(got), got)
 	}
 
 	got, _ = NormalizeAllowedModels([]string{"cn:pro-model"})
@@ -127,15 +127,15 @@ func TestNormalizeModelAliases(t *testing.T) {
 		t.Errorf("all invalid → %v, want nil", got)
 	}
 
-	// 裸名键：两域都生效，键小写化
+	// 裸名键：三域都生效，键小写化
 	got := NormalizeModelAliases([]string{"My-GPT=glm-5.2"})
-	for _, k := range []string{"cn:my-gpt", "global:my-gpt"} {
+	for _, k := range []string{"cn:my-gpt", "global:my-gpt", "qodercn:my-gpt"} {
 		if got[k] != "glm-5.2" {
 			t.Errorf("bare key: %q = %q, want glm-5.2 (%v)", k, got[k], got)
 		}
 	}
-	if len(got) != 2 {
-		t.Errorf("bare key: got %d entries %v, want 2", len(got), got)
+	if len(got) != 3 {
+		t.Errorf("bare key: got %d entries %v, want 3", len(got), got)
 	}
 
 	// 域前缀键：只在该域生效；值带前缀原样保留（跨域指向）

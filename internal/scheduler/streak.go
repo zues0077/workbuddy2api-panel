@@ -25,6 +25,9 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
+		if a.IsQoderCN() {
+			continue // qodercn 无 WorkBuddy 连登/兑换/抽奖体系
+		}
 		if a.IsGlobal() {
 			// D4 门控只覆盖 CN 成长体系（连登/补签/兑换/抽奖走 CN web base）。礼包是
 			// billing 域、按 realm 走 base，国际号实测 200——一并跳过就会静默漏领国际区活动。

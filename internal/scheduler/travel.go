@@ -61,6 +61,9 @@ func (s *Scheduler) runTravel(ctx context.Context, spread bool) {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		if a.IsQoderCN() {
+			continue // qodercn 无 WorkBuddy 猫猫旅行体系
+		}
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
