@@ -1,22 +1,18 @@
 name: upstream-watch
 
-# 跟随上游 misakano7545/workbuddy2api-panel 的发布：
-# 上游每出一个 Release（tag），我们就把 main 同步过去、用同一个 tag 号发我们自己的
-# Release + GHCR 镜像 + fpk。版本号保持一致，方便回溯「我们的哪版对应上游哪版」。
+# 纯上游镜像：把 misakano7545/workbuddy2api-panel 的 main 同步进我们的 main。
+# 不打 tag、不发版、不建 Release——本仓库唯一的产物线是 fusion.yml（sddvcm → fpk）。
 #
 # 只做快进或干净合并：一旦有冲突就 abort 并让这次运行失败，绝不自动取舍。
-# 手动跑同样生效，需要指定上游 tag 时用 inputs.tag。
+# 唯一的机械例外：上游自带的 binaries.yml / docker-ghcr.yml 我们已刻意删除（面板
+# 发版线整体下线），但上游改这两个文件时会和我们「删除」产生 modify/delete 冲突、
+# 或把文件「复活」进合并结果——这两种情况都按「维持删除」处理（git rm 后继续提交）。
+# 其余任何路径的冲突仍然 abort 交人工。
 on:
   schedule:
-    # 每天一次，23:17 UTC = 北京时间 07:17：早上起来正好把上游前一天的发布收掉。
-    # 上游发布不密集，每小时跑只会堆一堆空转的运行记录。
+    # 每天一次，23:17 UTC = 北京时间 07:17：早上起来正好把上游前一天的提交收掉。
     - cron: "17 23 * * *"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "指定要跟的上游 tag（留空 = 上游最新 Release）"
-        required: false
-        type: string
+  workflow_dispatch: {}
 
 concurrency:
   group: upstream-watch
@@ -34,6 +30,9 @@ permissions:
 
 env:
   UPSTREAM: misakano7545/workbuddy2api-panel
+  # 这两条流水线是「上游自带、我们刻意删除」的：同步时上游对它们的任何改动
+  # 都不算冲突内容，直接维持删除。
+  DROP_WORKFLOWS: ".github/workflows/binaries.yml .github/workflows/docker-ghcr.yml"
 
 jobs:
   follow:
@@ -57,23 +56,21 @@ jobs:
           if [[ -z "$FOLLOW_PAT" ]]; then
             # 不用 heredoc：块标量里的行必须保持缩进，顶格写会把 run: | 直接截断，
             # 工作流解析失败（连 job 都不生成）。
-            echo '::error::缺少 Actions secret FOLLOW_PAT，跟随无法自动发版。'
-            echo '::error::两个硬性限制叠在一起：GITHUB_TOKEN 既推不动含 .github/workflows/* 变更的引用，'
-            echo '::error::它产生的 push/tag/Release 也不会级联触发别的工作流。'
-            echo '::error::建一个 classic PAT（scopes: repo + workflow + write:packages），再：'
+            echo '::error::缺少 Actions secret FOLLOW_PAT，同步无法推送。'
+            echo '::error::上游只要动过 .github/workflows/*，GITHUB_TOKEN 就推不动这引用，'
+            echo '::error::且它产生的 push 永不级联触发工作流。'
+            echo '::error::建一个 classic PAT（scopes: repo + workflow），再：'
             echo '::error::    gh secret set FOLLOW_PAT --repo <owner>/<repo>'
             exit 1
           fi
-          echo "FOLLOW_PAT 已就位（用户身份推送，才能触发后续 binaries/docker/exe/fpk）"
+          echo "FOLLOW_PAT 已就位（用户身份推送）"
 
       - name: Resolve push identity
         env:
           GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
         run: |
           set -euo pipefail
-          # 合并提交落在 token 对应的真人名下：这是发版归属的正确写法，也让
-          # 「谁跟的版」在 git log 里对得上。注意它不是上一条推送失败的原因
-          # （那次是 checkout 的 extraHeader 把 GITHUB_TOKEN 塞进了认证，见上）。
+          # 合并提交落在 token 对应的真人名下，git log 里「谁跟的版」对得上。
           LOGIN=$(gh api user --jq .login)
           NOREPLY=$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')
           echo "PUSH_LOGIN=$LOGIN" >> "$GITHUB_ENV"
@@ -81,121 +78,49 @@ jobs:
           echo "合并提交将以 $LOGIN <$NOREPLY> 身份落库"
 
       - name: Fetch upstream
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
-          git fetch -q upstream main --tags
-          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            WANT="${{ github.event.inputs.tag }}"
-          else
-            WANT=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
-          fi
-          # 写进 $GITHUB_ENV 只对后续步骤可见，当前这一步里它仍是未绑定变量，
-          # 所以下面要用 WANT 打印，别再引用 TAG。
-          echo "TAG=$WANT" >> "$GITHUB_ENV"
-          echo "目标上游 tag: $WANT"
-
-      - name: Check whether already followed
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [[ -z "$TAG" || "$TAG" == "null" ]]; then
-            echo "拿不到上游 tag，退出"; exit 1
-          fi
-          # 不能用「本地有没有这个 tag」判断：上一步 fetch upstream --tags 会把
-          # 上游的标签全导入本地，于是任何 tag 都看起来「已跟过」，跟随逻辑永不触发。
-          # 口径改成我们自己发布过没有——看我们的 Release，以及标签在不在 origin 上。
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "$TAG 我们已经发过 Release，跳过本次跟随"
-            echo "SKIP=true" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          echo "SKIP=false" >> "$GITHUB_ENV"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
-            echo "TAG_ON_ORIGIN=true" >> "$GITHUB_ENV"
-            echo "标签已在 origin 但没有 Release（上次发版失败），这次补跑 binaries"
-          else
-            echo "TAG_ON_ORIGIN=false" >> "$GITHUB_ENV"
-          fi
-          if git merge-base --is-ancestor "$TAG" HEAD; then
-            echo "代码已在 main 里，只差发版"
-          else
-            echo "需要先把 $TAG 的提交合进 main"
-          fi
+          # 不带 --tags：本仓库已不再打 v* 标签，上游标签导进来只会误导排查。
+          git fetch -q upstream main
+          echo "upstream/main = $(git rev-parse --short upstream/main)"
 
       - name: Sync main with upstream
-        if: env.SKIP == 'false' && success()
         env:
           FOLLOW_PAT: ${{ secrets.FOLLOW_PAT }}
         run: |
           set -euo pipefail
           # 提交者身份要落到仓库配置：只写在单条命令的 -c 上，第二条 merge 命令
           # 拿不到身份，会报 "Committer identity unknown" 并直接失败。
-          # 身份用上面解析出的 token 对应用户，不能用 github-actions[bot]——bot 身份
-          # 会被按 GitHub App 对待，含工作文件改动的合并就推不上去（见 Resolve push identity）。
           git config user.name "$PUSH_LOGIN"
           git config user.email "$PUSH_EMAIL"
           if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "upstream/main 已全部包含在本地历史，无需合并"
+            echo "upstream/main 已全部包含在本地历史，无需同步"
             exit 0
           fi
-          git merge --ff-only upstream/main || {
-            echo "快进失败（我们有自己的提交），尝试干净合并"
-            git merge --no-edit upstream/main || {
-              echo "::error::与上游 main 存在冲突，已 abort。需要人工合并后再发版。"
-              git merge --abort || true
-              exit 1
-            }
-          }
+          if git merge --ff-only upstream/main; then
+            :
+          else
+            echo "快进失败（我们有自己的提交：workflows 裁剪 + fusion 线），尝试干净合并"
+            if ! git merge --no-edit upstream/main; then
+              # 机械化解我们刻意删除的路径：modify/delete 冲突 → 维持删除。
+              DROPPED=false
+              for f in $DROP_WORKFLOWS; do
+                if git status --porcelain -- "$f" | grep -qE '^(UU|DU|UD|AU|UA|AA|DD)'; then
+                  git rm --ignore-unmatch -f -- "$f"
+                  DROPPED=true
+                fi
+              done
+              if [[ "$DROPPED" == "true" ]]; then
+                git commit --no-edit && echo "已按「维持删除」处理 $DROP_WORKFLOWS 的同步冲突"
+              else
+                echo "::error::与上游 main 存在非预期路径的冲突，已 abort。需要人工合并。"
+                git merge --abort || true
+                exit 1
+              fi
+            fi
+          fi
           # checkout 配的 origin 用 GITHUB_TOKEN，这里换成显式 URL：PAT 是用户身份，
-          # 既能推含工作流文件的引用，也算「人」的 push，才会触发 binaries/docker。
+          # 才推得动含 .github/workflows/* 变更的引用。
           git push "https://x-access-token:${FOLLOW_PAT}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
           echo "main 已同步到 $(git rev-parse --short HEAD)"
-
-      - name: Tag and let the release pipeline take over
-        if: env.SKIP == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
-        run: |
-          set -euo pipefail
-          # 用上游同号标签：我们的哪版对应上游哪版一目了然。
-          # binaries（建 Release）/docker-ghcr/exe 都在 push v* 上触发，fpk 等 binaries 出 zip。
-          if [[ "$TAG_ON_ORIGIN" == "true" ]]; then
-            echo "标签已存在，跳过推送，直接补跑 binaries.yml"
-            gh workflow run binaries.yml --ref "$TAG"
-            exit 0
-          fi
-          UP_COMMIT=$(git rev-list -n 1 "$TAG")
-          # tag 打在**我们同步后的 main** 上，不打在上游那个提交上。
-          # 实测原因：GitHub 按「被推 ref 的文件树里有哪些工作流」决定触发什么。
-          # 上游那个提交里只有 binaries/docker-ghcr/autobot，我们的 exe.yml、fpk.yml
-          # 是后来才加的、只存在于我们 main 的树里 —— 直接指过去，exe 和 fpk 永远不亮
-          # （2026-11-02 跟 v2026.11.1.905 时就是这样，只有 binaries+docker 跑了）。
-          # 版本号仍然用上游同号，对应关系靠 tag 名 + 下面的祖先校验保持可追溯。
-          git merge-base --is-ancestor "$TAG" HEAD || {
-            echo "::error::上游 $TAG 不在同步后的 main 历史里，不该发生，拒绝发版"
-            exit 1
-          }
-          # -f：上一步 fetch --tags 已在本地建了同名 tag，不加 -f 会报 already exists。
-          git tag -f "$TAG" HEAD
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" -f "$TAG"
-          echo "已推送 $TAG -> $(git rev-parse --short HEAD)（上游 $TAG 为 ${UP_COMMIT:0:7}；Release/镜像/exe/fpk 由各自工作流产出）"
-
-      - name: Verify the chain actually started
-        if: env.SKIP == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
-        run: |
-          set -euo pipefail
-          # 这一看不是洁癖：GITHUB_TOKEN 建的 tag/Release 永不触发别的工作流，
-          # 那种情况下这里会安静地什么都等不到，发版就丢了。PAT 在位时 20 秒内必然排上。
-          sleep 20
-          if gh run list --workflow binaries.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId' | grep -qE '[0-9]'; then
-            echo "binaries.yml 已为 $TAG 排上，链已接通"
-          else
-            echo "::error::推送成功但没有工作流被触发——说明推送用的还是 GITHUB_TOKEN 身份。请确认 FOLLOW_PAT 有效且带 workflow scope。"
-            exit 1
-          fi

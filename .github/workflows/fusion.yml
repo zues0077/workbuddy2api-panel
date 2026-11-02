@@ -1,20 +1,14 @@
 name: fusion
 
-# 融合版产物线：把 sddvcm/workbuddy-api（多渠道聚合：WorkBuddy / Qoder / 智谱 /
-# 千问办公 / 小浣熊 / Loomy 等十余个平台）按我们自己的流水线打成三种可用件，
-# 发到同一个 Release：
-#   - wb2apifusion-<ver>-win-amd64.zip      Windows（exe + 启动.bat + 中文说明）
-#   - wb2apifusion-<ver>-{x86,arm}.fpk      飞牛 NAS 应用包（官方 fnpack 打）
-#   - ghcr.io/<我们仓库>/fusion:<ver>        多架构容器镜像
+# 融合版产物线：跟踪 sddvcm/workbuddy-api（多渠道聚合：WorkBuddy / Qoder / 智谱 /
+# 千问办公 / 小浣熊 / Loomy 等十余个平台），上游一更新就在我们的 Release 里
+# 出两个飞牛 NAS 应用包：
+#   - wb2apifusion-<ver>-x86.fpk   （amd64）
+#   - wb2apifusion-<ver>-arm.fpk   （arm64）
 #
-# Windows 为什么发 zip 而不是裸 exe（2026-11-02 实测出来的坑，别再改回去）：
-# 这个 exe 是 -H windowsgui 构建，双击没有任何窗口，起不来就静默消失；而它和面板本体
-# （wb2apiplus）默认都用端口 7863、都用同一个文件名 config.json，两边 listen 格式还
-# 互不兼容（融合版是对象 {"host","port"}，面板是字符串）——两个 exe 放同一目录时，
-# 后启动的那个读到对方的 config.json 会当场退出，用户只看到「闪退」。
-# 启动.bat 用 WILDWORK_HOME 把数据目录挪进 data\、用 WILDWORK_LISTEN 把端口挪到 17865，
-# 两个程序从此互不打架；不预置 config.json，API Key 仍由程序首启随机生成
-# （预置就等于把同一个 key 发给所有下载者）。
+# 2026-11-02 起产物裁剪：不再出 Windows zip、不再推 GHCR 镜像——Release 只保留 fpk。
+# 面板本体（wb2apiplus）的发版线（binaries/exe/fpk/docker-ghcr）已整体删除，
+# 本仓库回归「上游镜像 + 融合 fpk」两个职责。
 #
 # 为什么是「拉上游源码重新打包」而不是把渠道代码并进面板：
 # 两仓库 module path 不同（workbuddy-api vs github.com/misakano7545/workbuddy2api-panel）、
@@ -22,7 +16,7 @@ name: fusion
 # 所以「融合」先落到**产物级**：上游一更新，这里重跑就出新包（schedule 每天比对 commit）。
 #
 # Release tag 故意用 fusion-<版本号> 而不是 v<版本号>：
-#   1. 不撞 binaries/docker/exe/fpk 那四条 `push: tags: ["v*"]` 的流水线（它们打面板本体）；
+#   1. 不撞任何 v* 流水线（面板发版线虽已删，但上游同步可能带回同名工作流）；
 #   2. 面板内置 updater 的 parseVersion 只认「4 段纯数字」标签，`fusion-0.x` 恒不匹配，
 #      不会把面板的「检测到新版本」指到融合包上（指错了会下错资产）。
 #
@@ -48,16 +42,11 @@ concurrency:
 
 permissions:
   contents: write
-  packages: write
 
 env:
-  REGISTRY: ghcr.io
   FUSION_REPO: sddvcm/workbuddy-api
   APP_NAME: wb2apifusion
   FNPACK_VERSION: 1.2.3
-  # 子路径镜像：GITHUB_TOKEN 的 packages:write 作用域是「本仓库命名空间」，
-  # ghcr.io/<owner>/<repo>/fusion 仍在该命名空间内，不需要额外 PAT。
-  IMAGE_NAME: ${{ github.repository }}/fusion
 
 jobs:
   resolve:
@@ -85,7 +74,7 @@ jobs:
           SHA=$(gh api "repos/$FUSION_REPO/commits/$REF" --jq '.sha')
           [[ -n "$SHA" ]] || { echo "::error::拿不到 $FUSION_REPO@$REF 的 commit"; exit 1; }
           # 飞牛版本号只收纯数字分段：上游 tag v0.1.6 去掉 v 正好；
-          # ref 是分支时按上海时间取号，前面补 0 段，确保与面板的时间标签不同形。
+          # ref 是分支时按上海时间取号，前面补 0 段。
           if gh api "repos/$FUSION_REPO/git/ref/tags/$REF" --jq .ref >/dev/null 2>&1; then
             VERSION="${REF#v}"
           else
@@ -115,12 +104,12 @@ jobs:
           # 幂等判据写在 Release 正文里（commit 链接含完整 sha），不额外维护状态文件。
           # 但**正文对上不代表货齐**：Release 是 resolve job 先建的，build job 中途挂掉
           # 会留下一个「sha 已记录、资产却缺件」的半成品。只按正文跳过，就会永远跳过
-          # 一条坏产物线 —— 所以再要求三样资产都在。
+          # 一条坏产物线 —— 所以再要求两个 fpk 都在。
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.body // ""' 2>/dev/null || true)
           VERSION="${{ steps.pick.outputs.version }}"
           HAVE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)
           COMPLETE=true
-          for want in "$APP_NAME-$VERSION-x86.fpk" "$APP_NAME-$VERSION-arm.fpk" "$APP_NAME-$VERSION-win-amd64.zip"; do
+          for want in "$APP_NAME-$VERSION-x86.fpk" "$APP_NAME-$VERSION-arm.fpk"; do
             grep -qx "$want" <<< "$HAVE" || COMPLETE=false
           done
           if [[ -n "$BODY" && "$BODY" == *"$SHA"* && "$COMPLETE" == "true" ]]; then
@@ -148,10 +137,7 @@ jobs:
 
           上游提交：https://github.com/${FUSION_REPO}/commit/${UPSTREAM_SHA}
 
-          - \`*.fpk\`：飞牛 NAS 应用包。面板在**根路径**（不是 /panel/），默认端口 7865，可与 wb2api+ 的 7863 在同一台 NAS 共存。
-          - \`wb2apifusion-${VERSION}-win-amd64.zip\`：Windows 用。**解压到独立文件夹后双击「启动.bat」**，面板 http://127.0.0.1:17865/ 、模型地址 http://127.0.0.1:17865/v1。
-            不要直接双击里面的 exe，也不要和 wb2apiplus 的 exe 放同一目录：两者默认端口与 config.json 会互相抢，失败时没有任何提示（zip 里的启动脚本已把端口和数据目录隔开）。
-          - 镜像：\`ghcr.io/${IMAGE_NAME}:${VERSION}\`
+          - \`wb2apifusion-${VERSION}-x86.fpk\` / \`-arm.fpk\`：飞牛 NAS 应用包。面板在**根路径**（不是 /panel/），默认端口 7865。
 
           ⚠️ 本包由 CI 从上游源码重新打包，代码与渠道实现归 sddvcm 维护；账号风控与可用性请自行评估。"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -210,97 +196,6 @@ jobs:
           file "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}"
           sha256sum "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}"
 
-      # Windows 单文件只在一个 job 里造：交叉编译不依赖宿主架构，
-      # 两个 job 各传一遍会在 Release 上留两份同名资产的重传记录。
-      - name: Build windows exe (x86 job only)
-        if: matrix.platform == 'x86'
-        run: |
-          set -euo pipefail
-          cd fusion-src
-          # -H windowsgui 与上游 scripts/build_release.sh 一致：无控制台窗口，
-          # 托盘由程序自己按 --no-tray 判定。少了这个 flag，双击就是黑框。
-          # 产物落工作区根目录（与 linux 二进制同处），后面的上传步骤按根目录路径找。
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w -H windowsgui" -o "../workbuddy-api-${VERSION}-win-amd64.exe" ./cmd/workbuddy-api
-          cd ..
-          sha256sum "workbuddy-api-${VERSION}-win-amd64.exe"
-
-      # 出货形态：exe + 启动脚本 + 中文说明，打成 zip（原因见文件头注释）。
-      # 脚本里两个变量就是全部魔法：WILDWORK_HOME 换数据目录、WILDWORK_LISTEN 换端口。
-      # 文件名一律 ASCII（start.bat / README.txt）—— zip 里的中文名在部分解压工具下会变乱码。
-      - name: Package Windows zip (x86 job only)
-        if: matrix.platform == 'x86'
-        run: |
-          set -euo pipefail
-          STAGE="wb2apifusion-${VERSION}-win-amd64"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cp "workbuddy-api-${VERSION}-win-amd64.exe" "$STAGE/workbuddy-api.exe"
-          cat > "$STAGE/start.bat" <<'BAT'
-          @echo off
-          setlocal
-          set "WILDWORK_HOME=%~dp0data"
-          set "WILDWORK_LISTEN=127.0.0.1:17865"
-          if not exist "%WILDWORK_HOME%" mkdir "%WILDWORK_HOME%"
-          echo ==========================================================
-          echo  wb2apifusion - fusion build of sddvcm/workbuddy-api
-          echo  panel      : http://127.0.0.1:17865/
-          echo  api base   : http://127.0.0.1:17865/v1
-          echo  data dir   : %WILDWORK_HOME%
-          echo  api key    : printed below on first run, also in data\config.json
-          echo  usage doc  : README.txt
-          echo ==========================================================
-          echo.
-          "%~dp0workbuddy-api.exe"
-          echo.
-          echo [start.bat] process exited. Window stays open so you can read
-          echo the last lines. Press any key to close.
-          pause >nul
-          BAT
-          # .bat 必须是 CRLF：cmd.exe 对 LF-only 脚本的 goto/label 与部分行解析会出问题。
-          sed -i 's/$/\r/' "$STAGE/start.bat"
-          file "$STAGE/start.bat"
-          cat > "$STAGE/README.txt" <<'TXT'
-          wb2apifusion 融合版（多渠道聚合网关）
-
-          怎么用
-          1. 把整个文件夹解压到任意位置（和 wb2apiplus 的 exe 放同一目录也可以，
-             但必须用 start.bat 启动 —— 直接双击 exe 会撞，见下一节）。
-          2. 双击 start.bat。窗口里会打印你的 API Key（首次启动自动生成）。
-          3. 浏览器打开 http://127.0.0.1:17865/ ，在「添加账号」里登录各平台
-             （qoder 国内/国际、trae、千问办公、MonkeyCode、小浣熊、Loomy、智谱清言…）。
-          4. AI 客户端填：API 地址 http://127.0.0.1:17865/v1，Key 用第 2 步打印的那个
-             （也存在 data\config.json 的 api_key 字段）。
-
-          为什么不直接双击 workbuddy-api.exe
-          - 它是无控制台构建，启动失败时不留任何窗口，看起来就是「闪退」。
-          - 它默认端口 7863，和 wb2apiplus（面板本体）撞；两者的 config.json 格式还互不
-            兼容（这里是对象 {"host","port"}，面板那边是字符串），放在同一目录时后启动的
-            那个会读到对方的 config.json 并当场退出。
-          - start.bat 只做两件事：把数据目录指到本目录的 data\，把端口指到 17865。
-
-          数据在哪 / 怎么重置
-          配置、账号凭据、日志全在 data\ 里 —— 里面是各平台的登录凭据，属敏感文件，别外发。
-          想彻底重置：退出程序后删除 data\ 文件夹。
-
-          和 wb2apiplus 的区别
-          wb2apiplus = 上游 workbuddy2api-panel，只支持 WorkBuddy 国内/国际版，界面在 /panel/，端口 7863。
-          本包 = sddvcm/workbuddy-api，十余个渠道，界面在根路径，端口 17865。两者可在同一台机器同时运行。
-          TXT
-          zip -X -q -r "wb2apifusion-${VERSION}-win-amd64.zip" "$STAGE"
-          unzip -l "wb2apifusion-${VERSION}-win-amd64.zip"
-          sha256sum "wb2apifusion-${VERSION}-win-amd64.zip"
-
-      - name: Upload linux binary & Windows zip
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "$RELEASE_TAG" "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}" --clobber
-          if [[ -f "wb2apifusion-${VERSION}-win-amd64.zip" ]]; then
-            gh release upload "$RELEASE_TAG" "wb2apifusion-${VERSION}-win-amd64.zip" --clobber
-          fi
-
       - name: Stage fpk source tree
         run: |
           set -euo pipefail
@@ -357,65 +252,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$RELEASE_TAG" "$FINAL_FPK" --clobber
-
-      - name: Prepare image context
-        run: |
-          set -euo pipefail
-          # 上游 docker/Dockerfile 是「COPY workbuddy-api」的极简运行镜像：
-          # 不在容器里编译、不拉依赖，专治 NAS 上 go mod download 超时。
-          # 所以二进制必须就叫这个名字，落在 docker/ 目录里。
-          cp "workbuddy-api-${VERSION}-linux-${{ matrix.arch }}" fusion-src/docker/workbuddy-api
-          chmod +x fusion-src/docker/entrypoint.sh
-          ls -l fusion-src/docker
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & push per-arch image
-        uses: docker/build-push-action@v6
-        with:
-          context: fusion-src/docker
-          platforms: linux/${{ matrix.arch }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}-${{ matrix.arch }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            io.fusion.upstream=${{ env.FUSION_REPO }}
-            io.fusion.upstream.sha=${{ env.UPSTREAM_SHA }}
-          provenance: false
-          # 不加 type=gha 缓存：runner 默认 buildx 是 docker driver，它**不支持缓存导出**
-          # （报 "Cache export is not supported for the docker driver"）。要用就得额外
-          # setup-buildx 起 docker-container driver，而这个镜像只是 alpine + 一个 COPY，
-          # 没有任何值得缓存的层 —— 删缓存比加 driver 便宜。
-
-  manifest:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.resolve.outputs.version }}
-    steps:
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Merge per-arch images into one multi-arch tag
-        run: |
-          set -euo pipefail
-          # 一条 buildx 命令同时产两架构要 QEMU 模拟 arm64（Go 链接阶段特别慢），
-          # 所以两个 job 各推一个 -amd64 / -arm64 标签，这里只合 manifest、不重传层。
-          IMG="$REGISTRY/$IMAGE_NAME"
-          docker buildx imagetools create \
-            -t "$IMG:$VERSION" -t "$IMG:latest" \
-            "$IMG:$VERSION-amd64" "$IMG:$VERSION-arm64"
-          docker buildx imagetools inspect "$IMG:$VERSION"
 
   # fpk 是「装到 NAS 上跑」的东西，出包后先在 runner 里把**包内那份 cmd/main**跑一遍
   # start → status → 根路径 → /healthz → stop 的闭环，而不是自己手写 config.json 再裸起二进制。
@@ -482,38 +318,3 @@ jobs:
             exit 1
           fi
           echo "smoke ok：$FPK 的 cmd/main 起停闭环，根路径 HTTP $ROOT_CODE、/healthz 通"
-
-      # Windows 那个 zip 里唯一改变程序行为的就是 start.bat 的两个环境变量，
-      # 所以拿同一 commit 编出的 linux 二进制把它们跑一遍：数据目录必须落在
-      # WILDWORK_HOME 下、监听必须是 127.0.0.1:17865、首启落盘的 config.json 要写回这两个值，
-      # 且 api_key 仍是程序随机生成的（预置 key = 把同一个 key 发给所有下载者）。
-      # 不验就等于把一份没人确认过的说明书发出去 —— 上一版「裸 exe 双击闪退」就是这么漏的。
-      - name: Verify the Windows launcher env contract
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "workbuddy-api-${VERSION}-linux-amd64" --clobber
-          BIN="workbuddy-api-${VERSION}-linux-amd64"
-          chmod +x "$BIN"
-          HOME_DIR=$(mktemp -d)
-          WILDWORK_HOME="$HOME_DIR" WILDWORK_LISTEN=127.0.0.1:17865 \
-            "./$BIN" --no-tray > "$HOME_DIR/run.log" 2>&1 &
-          RUNPID=$!
-          for _ in $(seq 1 20); do
-            sleep 1
-            curl -fsS http://127.0.0.1:17865/healthz >/dev/null 2>&1 && break
-          done
-          if ! kill -0 "$RUNPID" 2>/dev/null; then
-            echo "::error::按 start.bat 的 env 起不来，日志："
-            cat "$HOME_DIR/run.log"
-            exit 1
-          fi
-          test -f "$HOME_DIR/config.json" || { echo "::error::WILDWORK_HOME 没生效，config.json 不在指定目录"; exit 1; }
-          grep -q '"host": "127.0.0.1"' "$HOME_DIR/config.json"
-          grep -q '"port": 17865' "$HOME_DIR/config.json"
-          KEY=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["api_key"])' "$HOME_DIR/config.json")
-          [[ ${#KEY} -ge 24 ]] || { echo "::error::api_key 不是程序生成的随机值（长度 ${#KEY}）"; exit 1; }
-          kill "$RUNPID"
-          echo "launcher ok：WILDWORK_HOME/WILDWORK_LISTEN 在真二进制上生效，端口 17865、config 落点与自生成 key 都对"
