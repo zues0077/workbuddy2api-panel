@@ -17,14 +17,14 @@ name: fusion
 #   2. 面板内置 updater 的 parseVersion 只认「4 段纯数字」标签，`fusion-0.x` 恒不匹配，
 #      不会把面板的「检测到新版本」指到融合包上（指错了会下错资产）。
 #
-# 触发：schedule（发现 sddvcm 有新 commit 才动手）+ 手动指定 ref/force。
+# 触发：schedule（发现 sddvcm 出了新 Release 才动手，判据见 resolve 的 gate）+ 手动指定 ref/force。
 on:
   schedule:
     - cron: "23 23 * * *" # 每天一次，北京 07:23（错开 upstream-watch 的 07:17）
   workflow_dispatch:
     inputs:
       ref:
-        description: "sddvcm/workbuddy-api 的 ref（tag 名或分支，留空 = main）"
+        description: "sddvcm/workbuddy-api 的 ref（tag 名或分支，留空 = 上游最新 Release）"
         required: false
         type: string
       force:
@@ -65,7 +65,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          REF="${{ github.event.inputs.ref || 'main' }}"
+          # 默认跟「上游最新 Release 的 tag」而不是 main：产物号就长得像上游版本
+          # （fusion-0.1.6），NAS 上的人能对上是哪个上游版本；main 上的零散提交
+          # 不会每天催生一个新包。要看未发版的 main，手动把 ref 填成 main 即可。
+          REF="${{ github.event.inputs.ref }}"
+          if [[ -z "$REF" ]]; then
+            REF=$(gh api "repos/$FUSION_REPO/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          fi
+          [[ -n "$REF" ]] || REF=main
           SHA=$(gh api "repos/$FUSION_REPO/commits/$REF" --jq '.sha')
           [[ -n "$SHA" ]] || { echo "::error::拿不到 $FUSION_REPO@$REF 的 commit"; exit 1; }
           # 飞牛版本号只收纯数字分段：上游 tag v0.1.6 去掉 v 正好；
@@ -334,10 +341,10 @@ jobs:
             "$IMG:$VERSION-amd64" "$IMG:$VERSION-arm64"
           docker buildx imagetools inspect "$IMG:$VERSION"
 
-  # fpk 是「装到 NAS 上跑」的东西，出包后先在 runner 里真跑一次：
-  # 解包 → 按 cmd/main 的语义造 config.json → 起进程 → 打根路径与 /healthz。
-  # 这一步拦掉的是最常见的「装完起不来」（二进制架构错、config 字段名写错、
-  # 缺依赖库），而这些在飞牛界面上只会显示「启动失败」，排查成本极高。
+  # fpk 是「装到 NAS 上跑」的东西，出包后先在 runner 里把**包内那份 cmd/main**跑一遍
+  # start → status → 根路径 → /healthz → stop 的闭环，而不是自己手写 config.json 再裸起二进制。
+  # 拦掉的是最常见的「装完起不来 / 关不掉」：向导变量没读对、config.json 字段名写错、
+  # pid 文件与 pkill 路径不匹配（这些在飞牛界面上只显示「启动失败」，排查成本极高）。
   smoke:
     needs: [resolve, build]
     if: needs.resolve.outputs.skip != 'true'
@@ -346,55 +353,54 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
     steps:
-      - name: Unpack the published fpk and boot it
+      - name: Drive the packaged cmd/main lifecycle (start/status/stop)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           FPK="$APP_NAME-$VERSION-x86.fpk"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$FPK" --clobber
-          mkdir -p unpack
-          tar -xzf "$FPK" -C unpack
-          TGZ=$(find unpack -name 'app.tgz' | head -1)
+          mkdir -p outer app
+          tar -xzf "$FPK" -C outer
+          test -f outer/cmd/main
+          test -f outer/manifest
+          TGZ=$(find outer -maxdepth 1 -name 'app.tgz' | head -1)
           [[ -z "$TGZ" ]] && { echo "::error::$FPK 里没有 app.tgz，fnpack 的结构变了"; exit 1; }
-          mkdir -p app
           tar -xzf "$TGZ" -C app
-          BIN=$(find app -type f -name workbuddy-api | head -1)
-          [[ -z "$BIN" ]] && { echo "::error::app.tgz 里没有 workbuddy-api 二进制"; exit 1; }
+          # NAS 上的布局：app.tgz 的内容落在 ${TRIM_APPDEST}（所以 bin/workbuddy-api
+          # 正好是 cmd/main 里写的那个路径），cmd/ 落在包目录、不在 TRIM_APPDEST 下。
+          BIN="$PWD/app/bin/workbuddy-api"
+          test -f "$BIN"
           chmod +x "$BIN"
           file "$BIN"
-          MAIN=$(find app -type f -path '*/cmd/main' | head -1)
-          [[ -n "$MAIN" ]] && echo "cmd/main 随包发布：$MAIN"
+          grep -q '^appname *= *wb2apifusion$' <(tr -s ' ' < outer/manifest) || echo "::warning::manifest appname 不是 wb2apifusion"
 
+          APPDEST="$PWD/app"
           PKGVAR=$(mktemp -d)
-          mkdir -p "$PKGVAR/auths"
-          # 与 cmd/main 生成的是同一份字段集（程序只认这些顶层键）。
-          # 监听写 127.0.0.1：空主机名在程序侧算「对外暴露」，会因缺管理密码拒绝启动，
-          # 而 smoke 要验的是「二进制能不能起 + 根路径有没有界面」，不是那套安全闸门。
-          cat > "$PKGVAR/config.json" <<EOF
-          {
-            "listen": "127.0.0.1:7865",
-            "api_key": "smoke-key",
-            "admin_password": "smoke-pass",
-            "auth_dir": "$PKGVAR/auths",
-            "state_file": "$PKGVAR/state.json",
-            "region": "cn"
-          }
-          EOF
-          WILDWORK_HOME="$PKGVAR" "$BIN" --no-tray > "$PKGVAR/run.log" 2>&1 &
-          RUNPID=$!
-          for _ in $(seq 1 20); do
+          export TRIM_APPDEST="$APPDEST" TRIM_PKGVAR="$PKGVAR"
+          # 向导变量：cmd/main 里是 ${port}/${pwd} 直接读的。
+          port=7865 pwd=smoke-pass bash outer/cmd/main start
+          for _ in $(seq 1 25); do
             sleep 1
             curl -fsS http://127.0.0.1:7865/ >/dev/null 2>&1 && break
           done
-          if ! kill -0 "$RUNPID" 2>/dev/null; then
-            echo "::error::进程退出，运行日志："
-            cat "$PKGVAR/run.log"
+          port=7865 pwd=smoke-pass bash outer/cmd/main status || {
+            echo "::error::cmd/main status 说进程不在，运行日志："
+            cat "$PKGVAR/info.log" 2>/dev/null || true
             exit 1
-          fi
+          }
           # 融合版面板挂在 /（面板本体挂在 /panel/），首页必须是 HTML。
           ROOT_CODE=$(curl -fsS -o /tmp/root.html -w '%{http_code}' http://127.0.0.1:7865/)
           grep -qiE '<html|<!doctype' /tmp/root.html
           curl -fsS http://127.0.0.1:7865/healthz
-          echo "smoke ok：根路径 HTTP $ROOT_CODE、/healthz 通，二进制来自 $FPK"
-          kill -TERM "$RUNPID" 2>/dev/null || true
+          # 配置必须是 cmd/main 自己按向导落盘的（程序只读 config.json，不吃 env）
+          grep -q '"listen": ":7865"' "$PKGVAR/config.json"
+          grep -q '"admin_password": "smoke-pass"' "$PKGVAR/config.json"
+          # 停机：stop 之后端口必须没人监听，否则升级/重启会撞「地址已被占用」。
+          port=7865 pwd=smoke-pass bash outer/cmd/main stop
+          sleep 2
+          if curl -fsS http://127.0.0.1:7865/healthz >/dev/null 2>&1; then
+            echo "::error::cmd/main stop 之后 7865 仍在服务"
+            exit 1
+          fi
+          echo "smoke ok：$FPK 的 cmd/main 起停闭环，根路径 HTTP $ROOT_CODE、/healthz 通"
