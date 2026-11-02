@@ -279,6 +279,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+		// 根路径原本直落 "404 page not found"，双击 exe 的人打开 127.0.0.1:7863
+		// 会以为服务没起来；面板是唯一给人看的界面，这里把 / 指过去。
+		h.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/panel/", http.StatusFound)
+		})
 	}
 	if cfg.AdminEnabled {
 		h.mux.HandleFunc("POST /admin/tasks/{name}/run",
