@@ -55,6 +55,22 @@ jobs:
           ls -l "wb2apiplus-${VERSION}-win-amd64.exe"
           sha256sum "wb2apiplus-${VERSION}-win-amd64.exe"
 
+      - name: Wait for the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Release 是 binaries.yml 在同一次 tag push 里建的，它跑完之前 gh release
+          # upload 直接报 "release not found"。两条工作流并行起跑，必须轮询等对象存在。
+          for i in $(seq 1 30); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName >/dev/null 2>&1; then
+              echo "Release $TAG 已就绪（第 $i 次检查）"; exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::等 10 分钟仍未出现 Release $TAG；binaries.yml 可能失败了"
+          exit 1
+
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
