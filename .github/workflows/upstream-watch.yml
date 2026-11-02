@@ -1,0 +1,91 @@
+name: upstream-watch
+
+# 跟随上游 misakano7545/workbuddy2api-panel 的发布：
+# 上游每出一个 Release（tag），我们就把 main 同步过去、用同一个 tag 号发我们自己的
+# Release + GHCR 镜像 + fpk。版本号保持一致，方便回溯「我们的哪版对应上游哪版」。
+#
+# 只做快进或干净合并：一旦有冲突就 abort 并让这次运行失败，绝不自动取舍。
+# 手动跑同样生效，需要指定上游 tag 时用 inputs.tag。
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "指定要跟的上游 tag（留空 = 上游最新 Release）"
+        required: false
+        type: string
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: misakano7545/workbuddy2api-panel
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch -q upstream main --tags
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "TAG=${{ github.event.inputs.tag }}" >> "$GITHUB_ENV"
+          else
+            echo "TAG=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)" >> "$GITHUB_ENV"
+          fi
+          echo "目标上游 tag: ${TAG}"
+
+      - name: Check whether already followed
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAG" || "$TAG" == "null" ]]; then
+            echo "拿不到上游 tag，退出"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG 已经跟过，无需重复发版"
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          else
+            echo "需要同步：$TAG（尚未打过）"
+            echo "SKIP=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Sync main with upstream
+        if: env.SKIP == 'false'
+        run: |
+          set -euo pipefail
+          git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+            merge --ff-only upstream/main || {
+              echo "快进失败，尝试干净合并"
+              git merge --no-edit upstream/main || {
+                echo "::error::与上游 main 存在冲突，已 abort。需要人工合并后再发版。"
+                git merge --abort || true
+                exit 1
+              }
+            }
+          git push origin HEAD:main
+          echo "main 已同步到 $(git rev-parse --short HEAD)"
+
+      - name: Tag and let the release pipeline take over
+        if: env.SKIP == 'false'
+        run: |
+          set -euo pipefail
+          # 用上游同号标签：我们的哪版对应上游哪版一目了然。
+          # binaries/docker-ghcr/fpk 都在 push v* 上触发，这里不自己建 Release。
+          UP_COMMIT=$(git rev-list -n 1 "$TAG")
+          git tag -f "$TAG" "$UP_COMMIT"
+          git push origin "$TAG"
+          echo "已推送 $TAG -> $UP_COMMIT（Release/镜像/fpk 由各自工作流产出）"
