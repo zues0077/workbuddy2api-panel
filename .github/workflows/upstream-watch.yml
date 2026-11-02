@@ -53,23 +53,42 @@ jobs:
           echo "目标上游 tag: $WANT"
 
       - name: Check whether already followed
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ -z "$TAG" || "$TAG" == "null" ]]; then
             echo "拿不到上游 tag，退出"; exit 1
           fi
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "$TAG 已经跟过，无需重复发版"
+          # 不能用「本地有没有这个 tag」判断：上一步 fetch upstream --tags 会把
+          # 上游的标签全导入本地，于是任何 tag 都看起来「已跟过」，跟随逻辑永不触发。
+          # 口径改成我们自己发布过没有——看我们的 Release，以及标签在不在 origin 上。
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$TAG 我们已经发过 Release，跳过本次跟随"
             echo "SKIP=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "SKIP=false" >> "$GITHUB_ENV"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "TAG_ON_ORIGIN=true" >> "$GITHUB_ENV"
+            echo "标签已在 origin 但没有 Release（上次发版失败），这次补跑 binaries"
           else
-            echo "需要同步：$TAG（尚未打过）"
-            echo "SKIP=false" >> "$GITHUB_ENV"
+            echo "TAG_ON_ORIGIN=false" >> "$GITHUB_ENV"
+          fi
+          if git merge-base --is-ancestor "$TAG" HEAD; then
+            echo "代码已在 main 里，只差发版"
+          else
+            echo "需要先把 $TAG 的提交合进 main"
           fi
 
       - name: Sync main with upstream
-        if: env.SKIP == 'false'
+        if: env.SKIP == 'false' && success()
         run: |
           set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "upstream/main 已全部包含在本地历史，无需合并"
+            exit 0
+          fi
           git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
             merge --ff-only upstream/main || {
               echo "快进失败，尝试干净合并"
@@ -84,11 +103,19 @@ jobs:
 
       - name: Tag and let the release pipeline take over
         if: env.SKIP == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # 用上游同号标签：我们的哪版对应上游哪版一目了然。
-          # binaries/docker-ghcr/fpk 都在 push v* 上触发，这里不自己建 Release。
+          # binaries（建 Release）/docker-ghcr/exe 都在 push v* 上触发，fpk 挂在 Release 之后。
+          if [[ "$TAG_ON_ORIGIN" == "true" ]]; then
+            echo "标签已存在，跳过推送，直接补跑 binaries.yml"
+            gh workflow run binaries.yml --ref "$TAG"
+            exit 0
+          fi
           UP_COMMIT=$(git rev-list -n 1 "$TAG")
+          # -f：上一步 fetch --tags 已在本地建了同名 tag，不加 -f 会报 already exists。
           git tag -f "$TAG" "$UP_COMMIT"
           git push origin "$TAG"
-          echo "已推送 $TAG -> $UP_COMMIT（Release/镜像/fpk 由各自工作流产出）"
+          echo "已推送 $TAG -> $UP_COMMIT（Release/镜像/exe/fpk 由各自工作流产出）"
