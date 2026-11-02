@@ -115,7 +115,10 @@ jobs:
           if [[ -z "${CHANGELOG_TEXT:-}" ]]; then
             CHANGELOG_TEXT=$(gh release view "$TAG" --json body --jq '.body // ""' 2>/dev/null || true)
           fi
-          [[ -z "$CHANGELOG_TEXT" ]] && CHANGELOG_TEXT="跟随上游更新 ${VERSION}"
+          # --generate-notes 在没有 PR 时只剩一行 "Full Changelog: ..."，
+          # 对 NAS 上的安装者没有信息量，去掉它；整段空了就用跟随说明兜底。
+          CHANGELOG_TEXT=$(printf '%s' "$CHANGELOG_TEXT" | sed '/^\*\*Full Changelog\*\*/d' | sed '/^[[:space:]]*$/d')
+          [[ -z "$CHANGELOG_TEXT" ]] && CHANGELOG_TEXT="跟随上游更新至 ${VERSION}"
           export CHANGELOG_TEXT
           python3 - "$APP_NAME/manifest" "$VERSION" "${{ matrix.platform }}" <<'PY'
           import json, os, sys

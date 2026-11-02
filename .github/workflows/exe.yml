@@ -1,0 +1,61 @@
+name: exe
+
+# Release 上额外挂一个免解压的 Windows x64 单文件（binaries.yml 发的是 zip 包，
+# 里面还带 config.example.json/README；这里只出裸 .exe，双击即用，
+# 首次运行会在同目录自己生成 config.json）。
+#
+# Windows 目标不需要 CGO，交叉编译在 linux runner 上做即可；
+# 图标/版本资源未内嵌，保持与 binaries.yml 产出的 exe 完全一致。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补发 exe 的 tag（留空 = 最新 tag）"
+        required: false
+        type: string
+
+concurrency:
+  group: exe-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          [[ "$TAG" == v* ]] || { echo "不是标签：$TAG（exe 只随 v* 发）"; exit 1; }
+          VERSION="${TAG#v}"
+          # 与 binaries.yml 同口径：标签号即二进制里烧进去的 appVersion，
+          # 面板据此判断有无新版；写错会让 updater 恒判 UpdateAvailable。
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" \
+            -o "wb2apiplus-${VERSION}-win-amd64.exe" ./cmd/server
+          ls -l "wb2apiplus-${VERSION}-win-amd64.exe"
+          sha256sum "wb2apiplus-${VERSION}-win-amd64.exe"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "wb2apiplus-${VERSION}-win-amd64.exe" --clobber
