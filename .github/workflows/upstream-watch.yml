@@ -8,7 +8,9 @@ name: upstream-watch
 # 手动跑同样生效，需要指定上游 tag 时用 inputs.tag。
 on:
   schedule:
-    - cron: "17 * * * *"
+    # 每天一次，23:17 UTC = 北京时间 07:17：早上起来正好把上游前一天的发布收掉。
+    # 上游发布不密集，每小时跑只会堆一堆空转的运行记录。
+    - cron: "17 23 * * *"
   workflow_dispatch:
     inputs:
       tag:

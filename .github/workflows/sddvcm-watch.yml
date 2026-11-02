@@ -1,0 +1,128 @@
+name: sddvcm-watch
+
+# 融合源 sddvcm/workbuddy-api 的「监视 + 报告」。
+#
+# 为什么不做自动合并：它是另一个血统的项目（module path 是
+# github.com/sddvcm/workbuddy-api，目录结构与面板实现都跟我们不同），
+# git merge 只会造出结构性冲突。所以这里只把它的新动作整理成一份能判断的
+# 报告，追加到一个固定 Issue 的评论里；移植哪几项由人决定。
+#
+# 状态记在那个 Issue 正文的 <!-- last: <sha> --> / <!-- rel: <tag> --> 两行里。
+# 不往仓库写状态文件：一是本仓库 .gitignore 忽略 *.md，二是往 main 提交会白触发
+# 一轮 binaries/docker。
+on:
+  schedule:
+    # 每天 07:37 北京时间，比 upstream-watch 晚 20 分钟，错开排队。
+    - cron: "37 23 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: sddvcm-watch
+  cancel-in-progress: false
+
+env:
+  SOURCE: sddvcm/workbuddy-api
+  ISSUE_TITLE: 融合源动向：sddvcm/workbuddy-api 移植候选
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Find or open the tracking issue
+        run: |
+          set -euo pipefail
+          NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $ISSUE_TITLE" --json number --jq '.[0].number // ""')
+          if [[ -z "$NUM" ]]; then
+            BODY=$(printf '%s\n' \
+              '<!-- last: none -->' \
+              '<!-- rel: none -->' \
+              '' \
+              "自动工作流 sddvcm-watch 每天把 $SOURCE 的新提交/新发布写成评论，移植哪几项人工决定。" \
+              '' \
+              '已核实不必移植：CSP（我们面板 internal/panel/index.go 的 setSecurityHeaders 早就有）、' \
+              'pool.prefer_expiring（面板也已有）。' \
+              '待移植：public_host —— 面板对外可达地址，对应 '"$SOURCE"' issue #2（bridge 网络下显示 172.18.0.x）。')
+            NUM=$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" --body "$BODY" | sed 's|.*/||')
+            echo "已建跟踪 Issue #$NUM"
+          else
+            echo "沿用已有跟踪 Issue #$NUM"
+          fi
+          echo "ISSUE=$NUM" >> "$GITHUB_ENV"
+
+      - name: Read baseline
+        run: |
+          set -euo pipefail
+          BODY=$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          LAST=$(printf '%s' "$BODY" | sed -n 's/.*<!-- last: \([0-9a-f]*\) -->.*/\1/p')
+          REL=$(printf '%s' "$BODY" | sed -n 's/.*<!-- rel: \([^ ]*\) -->.*/\1/p')
+          HEAD_SHA=$(gh api "repos/$SOURCE/commits?per_page=1" --jq '.[0].sha')
+          NEW_REL=$(gh api "repos/$SOURCE/releases?per_page=1" --jq '.[0].tag_name // "none"')
+          echo "LAST=${LAST:-none}" >> "$GITHUB_ENV"
+          echo "REL=${REL:-none}" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "NEW_REL=$NEW_REL" >> "$GITHUB_ENV"
+          echo "基线 commit=${LAST:-none} 发布=${REL:-none}；源当前 ${HEAD_SHA:0:7} 发布=$NEW_REL"
+
+      - name: Pin baseline on first run
+        if: env.LAST == 'none'
+        run: |
+          set -euo pipefail
+          # 第一次只钉基线：不这么做，首跑会把对方全部历史一次性糊到 Issue 上。
+          gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json body --jq .body > base.md
+          sed -i -e "s|<!-- last: [^ ]* -->|<!-- last: $HEAD_SHA -->|" \
+                 -e "s|<!-- rel: [^ ]* -->|<!-- rel: $NEW_REL -->|" base.md
+          grep -q "<!-- last: $HEAD_SHA -->" base.md || { echo "正文里的标记行没找到，拒绝盲改"; exit 1; }
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file base.md
+          echo "基线已钉到 ${HEAD_SHA:0:7}，本次不出报告"
+
+      - name: Build report
+        if: env.LAST != 'none'
+        run: |
+          set -euo pipefail
+          if [[ "$LAST" == "$HEAD_SHA" && "$NEW_REL" == "$REL" ]]; then
+            echo "源没有新动作，静默退出"
+            exit 0
+          fi
+          {
+            printf '## %s 动向\n\n' "$SOURCE"
+            printf '基线 `%s` → 当前 `%s`\n\n' "${LAST:0:7}" "${HEAD_SHA:0:7}"
+            printf '### 新提交\n\n'
+            if ! gh api "repos/$SOURCE/compare/$LAST...$HEAD_SHA" \
+              --jq '.commits[] | "- `" + (.sha[0:7]) + "` " + (.commit.committer.date[0:10]) + " " + (.commit.message | split("\n")[0])'; then
+              # 对方 force push 把基线提交弄没了，compare 会 404；退化成列最近 15 条。
+              printf -- '- compare 取不到（基线可能被 force push 覆盖），改列最近 15 条：\n'
+              gh api "repos/$SOURCE/commits?per_page=15" \
+                --jq '.[] | "- `" + (.sha[0:7]) + "` " + (.commit.committer.date[0:10]) + " " + (.commit.message | split("\n")[0])'
+            fi
+            printf '\n### 改动文件（前 25）\n\n'
+            gh api "repos/$SOURCE/compare/$LAST...$HEAD_SHA" \
+              --jq '.files[]? | "- `" + .filename + "` +" + (.additions|tostring) + "/-" + (.deletions|tostring)' \
+              | head -25 || true
+            if [[ "$NEW_REL" != "$REL" && "$NEW_REL" != "none" ]]; then
+              printf '\n### 新发布\n\n'
+              gh api "repos/$SOURCE/releases/tags/$NEW_REL" \
+                --jq '"- **" + (.tag_name) + "** " + (.published_at[0:10]) + "\n" + (.body // "" | split("\n")[0:12] | join("\n"))'
+            fi
+          } > report.md
+          wc -l report.md
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file report.md
+          echo "REPORTED=true" >> "$GITHUB_ENV"
+
+      - name: Move baseline forward
+        if: env.LAST != 'none'
+        run: |
+          set -euo pipefail
+          # 没有新动作也刷基线没坏处，但会白改 Issue 正文，所以只在真报过告时刷。
+          [[ "${REPORTED:-false}" == "true" ]] || exit 0
+          gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json body --jq .body > base.md
+          sed -i -e "s|<!-- last: [^ ]* -->|<!-- last: $HEAD_SHA -->|" \
+                 -e "s|<!-- rel: [^ ]* -->|<!-- rel: $NEW_REL -->|" base.md
+          grep -q "<!-- last: $HEAD_SHA -->" base.md || { echo "标记行没替换成功，保持原正文"; exit 1; }
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file base.md
+          echo "基线推进到 ${HEAD_SHA:0:7}"
