@@ -8,9 +8,13 @@ name: fpk
 # 触发：binaries.yml 建好 Release（内含 linux amd64/arm64 的 zip）之后自动补发 fpk；
 # 也可手动指定 tag 重跑。fnpack 是飞牛官方打包 CLI，第三方 fpk 无需官方签名，
 # manifest 里 source=thirdparty 即为社区应用。
+# 触发：与 binaries.yml 同一个 tag push。不能挂 release:published ——
+# Release 是 binaries.yml 用 GITHUB_TOKEN 建的，GitHub 规定由 GITHUB_TOKEN
+# 产生的事件不再触发新工作流（防递归），那条路永远不会亮。
+# 因此这里要自己等 Release 及其 zip 就位，再开始打包。
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -19,7 +23,7 @@ on:
         type: string
 
 concurrency:
-  group: fpk-${{ github.event.release.tag_name || github.event.inputs.tag || 'latest' }}
+  group: fpk-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -47,18 +51,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Resolve release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [[ -n "${{ github.event.release.tag_name }}" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
-          else
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
-          fi
-          [[ -z "$TAG" || "$TAG" == "null" ]] && { echo "找不到目标 release"; exit 1; }
-          # 飞牛版本号只收纯数字分段，不能带 v 或字母；我们的时间标签 v2026.11.2.840
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          [[ "$TAG" == v* ]] || { echo "不是 v* 标签：$TAG"; exit 1; }
+          # 飞牛版本号只收纯数字分段，不能带 v 或字母；我们的时间标签 v2026.11.2.953
           # 去掉 v 正好是四段，直接用。
           VERSION="${TAG#v}"
           [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] && { echo "版本号 $VERSION 不符合飞牛格式"; exit 1; }
@@ -67,6 +63,24 @@ jobs:
             echo "VERSION=$VERSION"
           } >> "$GITHUB_ENV"
           echo "tag=$TAG version=$VERSION"
+
+      - name: Wait for binaries.yml to publish the zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 同一次 tag push 里 binaries.yml 才创建 Release 并上传 zip；
+          # 它跑完之前这里是 404，所以轮询而不是直接下载。
+          ZIP="wb2api-panel-${VERSION}-linux-${{ matrix.arch }}.zip"
+          for i in $(seq 1 40); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+                 --jq '.assets[].name' 2>/dev/null | grep -qx "$ZIP"; then
+              echo "Release 已就绪（第 $i 次检查）"; exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::等 20 分钟仍未看到 $ZIP；binaries.yml 可能失败了"
+          exit 1
 
       - name: Download our own linux binary
         run: |

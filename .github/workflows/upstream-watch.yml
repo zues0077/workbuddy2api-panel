@@ -22,6 +22,11 @@ concurrency:
 
 permissions:
   contents: write
+  # 上游的提交动过 .github/workflows/*。GitHub 拒绝任何没有 workflows 权限的
+  # GitHub App token 推送含工作流文件变更的引用，报
+  # "refusing to allow a GitHub App to create or update workflow ... without
+  # workflows permission"——合并本身是干净的，卡在推送这一步。
+  workflows: write
 
 env:
   UPSTREAM: misakano7545/workbuddy2api-panel
