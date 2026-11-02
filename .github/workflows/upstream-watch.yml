@@ -22,11 +22,13 @@ concurrency:
 
 permissions:
   contents: write
-  # 上游的提交动过 .github/workflows/*。GitHub 拒绝任何没有 workflows 权限的
-  # GitHub App token 推送含工作流文件变更的引用，报
-  # "refusing to allow a GitHub App to create or update workflow ... without
-  # workflows permission"——合并本身是干净的，卡在推送这一步。
-  workflows: write
+  # 这里不能写 `workflows: write`：GITHUB_TOKEN 的 permissions 白名单里没有
+  # workflows 这一项，写了整份工作流直接解析失败（dispatch 报
+  # HTTP 422 Unexpected value 'workflows'，运行体 0 个 job、连日志都没有，
+  # 列表里只显示文件路径）。上游只要动过 .github/workflows/*，GitHub App 身份的
+  # GITHUB_TOKEN 就硬性拒推（"refusing to allow a GitHub App to create or update
+  # workflow ... without workflows permission"），这个权限无法授予 GITHUB_TOKEN。
+  # 唯一出路是用一个带 workflow scope 的 classic PAT，见下面 Resolve push token。
 
 env:
   UPSTREAM: misakano7545/workbuddy2api-panel
@@ -39,6 +41,23 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Resolve push token
+        env:
+          FOLLOW_PAT: ${{ secrets.FOLLOW_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$FOLLOW_PAT" ]]; then
+            # 不用 heredoc：块标量里的行必须保持缩进，顶格写会把 run: | 直接截断，
+            # 工作流解析失败（连 job 都不生成）。
+            echo '::error::缺少 Actions secret FOLLOW_PAT，跟随无法自动发版。'
+            echo '::error::两个硬性限制叠在一起：GITHUB_TOKEN 既推不动含 .github/workflows/* 变更的引用，'
+            echo '::error::它产生的 push/tag/Release 也不会级联触发别的工作流。'
+            echo '::error::建一个 classic PAT（scopes: repo + workflow + write:packages），再：'
+            echo '::error::    gh secret set FOLLOW_PAT --repo <owner>/<repo>'
+            exit 1
+          fi
+          echo "FOLLOW_PAT 已就位（用户身份推送，才能触发后续 binaries/docker/exe/fpk）"
 
       - name: Fetch upstream
         env:
@@ -88,6 +107,8 @@ jobs:
 
       - name: Sync main with upstream
         if: env.SKIP == 'false' && success()
+        env:
+          FOLLOW_PAT: ${{ secrets.FOLLOW_PAT }}
         run: |
           set -euo pipefail
           # 提交者身份要落到仓库配置：只写在单条命令的 -c 上，第二条 merge 命令
@@ -106,17 +127,19 @@ jobs:
               exit 1
             }
           }
-          git push origin HEAD:main
+          # checkout 配的 origin 用 GITHUB_TOKEN，这里换成显式 URL：PAT 是用户身份，
+          # 既能推含工作流文件的引用，也算「人」的 push，才会触发 binaries/docker。
+          git push "https://x-access-token:${FOLLOW_PAT}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
           echo "main 已同步到 $(git rev-parse --short HEAD)"
 
       - name: Tag and let the release pipeline take over
         if: env.SKIP == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
         run: |
           set -euo pipefail
           # 用上游同号标签：我们的哪版对应上游哪版一目了然。
-          # binaries（建 Release）/docker-ghcr/exe 都在 push v* 上触发，fpk 挂在 Release 之后。
+          # binaries（建 Release）/docker-ghcr/exe 都在 push v* 上触发，fpk 等 binaries 出 zip。
           if [[ "$TAG_ON_ORIGIN" == "true" ]]; then
             echo "标签已存在，跳过推送，直接补跑 binaries.yml"
             gh workflow run binaries.yml --ref "$TAG"
@@ -125,5 +148,21 @@ jobs:
           UP_COMMIT=$(git rev-list -n 1 "$TAG")
           # -f：上一步 fetch --tags 已在本地建了同名 tag，不加 -f 会报 already exists。
           git tag -f "$TAG" "$UP_COMMIT"
-          git push origin "$TAG"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$TAG"
           echo "已推送 $TAG -> $UP_COMMIT（Release/镜像/exe/fpk 由各自工作流产出）"
+
+      - name: Verify the chain actually started
+        if: env.SKIP == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
+        run: |
+          set -euo pipefail
+          # 这一看不是洁癖：GITHUB_TOKEN 建的 tag/Release 永不触发别的工作流，
+          # 那种情况下这里会安静地什么都等不到，发版就丢了。PAT 在位时 20 秒内必然排上。
+          sleep 20
+          if gh run list --workflow binaries.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId' | grep -qE '[0-9]'; then
+            echo "binaries.yml 已为 $TAG 排上，链已接通"
+          else
+            echo "::error::推送成功但没有工作流被触发——说明推送用的还是 GITHUB_TOKEN 身份。请确认 FOLLOW_PAT 有效且带 workflow scope。"
+            exit 1
+          fi
