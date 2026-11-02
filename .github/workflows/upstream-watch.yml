@@ -169,10 +169,20 @@ jobs:
             exit 0
           fi
           UP_COMMIT=$(git rev-list -n 1 "$TAG")
+          # tag 打在**我们同步后的 main** 上，不打在上游那个提交上。
+          # 实测原因：GitHub 按「被推 ref 的文件树里有哪些工作流」决定触发什么。
+          # 上游那个提交里只有 binaries/docker-ghcr/autobot，我们的 exe.yml、fpk.yml
+          # 是后来才加的、只存在于我们 main 的树里 —— 直接指过去，exe 和 fpk 永远不亮
+          # （2026-11-02 跟 v2026.11.1.905 时就是这样，只有 binaries+docker 跑了）。
+          # 版本号仍然用上游同号，对应关系靠 tag 名 + 下面的祖先校验保持可追溯。
+          git merge-base --is-ancestor "$TAG" HEAD || {
+            echo "::error::上游 $TAG 不在同步后的 main 历史里，不该发生，拒绝发版"
+            exit 1
+          }
           # -f：上一步 fetch --tags 已在本地建了同名 tag，不加 -f 会报 already exists。
-          git tag -f "$TAG" "$UP_COMMIT"
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$TAG"
-          echo "已推送 $TAG -> $UP_COMMIT（Release/镜像/exe/fpk 由各自工作流产出）"
+          git tag -f "$TAG" HEAD
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" -f "$TAG"
+          echo "已推送 $TAG -> $(git rev-parse --short HEAD)（上游 $TAG 为 ${UP_COMMIT:0:7}；Release/镜像/exe/fpk 由各自工作流产出）"
 
       - name: Verify the chain actually started
         if: env.SKIP == 'false'
