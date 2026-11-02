@@ -264,7 +264,8 @@ jobs:
           wb2apifusion 融合版（多渠道聚合网关）
 
           怎么用
-          1. 把整个文件夹解压到任意位置，**不要和 wb2apiplus 的 exe 放同一目录**。
+          1. 把整个文件夹解压到任意位置（和 wb2apiplus 的 exe 放同一目录也可以，
+             但必须用 start.bat 启动 —— 直接双击 exe 会撞，见下一节）。
           2. 双击 start.bat。窗口里会打印你的 API Key（首次启动自动生成）。
           3. 浏览器打开 http://127.0.0.1:17865/ ，在「添加账号」里登录各平台
              （qoder 国内/国际、trae、千问办公、MonkeyCode、小浣熊、Loomy、智谱清言…）。
