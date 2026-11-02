@@ -85,19 +85,22 @@ jobs:
         if: env.SKIP == 'false' && success()
         run: |
           set -euo pipefail
+          # 提交者身份要落到仓库配置：只写在单条命令的 -c 上，第二条 merge 命令
+          # 拿不到身份，会报 "Committer identity unknown" 并直接失败。
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "upstream/main 已全部包含在本地历史，无需合并"
             exit 0
           fi
-          git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
-            merge --ff-only upstream/main || {
-              echo "快进失败，尝试干净合并"
-              git merge --no-edit upstream/main || {
-                echo "::error::与上游 main 存在冲突，已 abort。需要人工合并后再发版。"
-                git merge --abort || true
-                exit 1
-              }
+          git merge --ff-only upstream/main || {
+            echo "快进失败（我们有自己的提交），尝试干净合并"
+            git merge --no-edit upstream/main || {
+              echo "::error::与上游 main 存在冲突，已 abort。需要人工合并后再发版。"
+              git merge --abort || true
+              exit 1
             }
+          }
           git push origin HEAD:main
           echo "main 已同步到 $(git rev-parse --short HEAD)"
 
