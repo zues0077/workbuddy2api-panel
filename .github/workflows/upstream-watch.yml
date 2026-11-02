@@ -42,7 +42,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
+          # 关键：不能让 checkout 把 GITHUB_TOKEN 写进 http.extraHeader。它一旦写上，
+          # 优先级高于 push URL 里的凭据，我们塞的 FOLLOW_PAT 根本不生效，报错仍然是
+          # 「refusing to allow a GitHub App to create or update workflow」——排查时
+          # 很容易误判成 token 或提交身份的问题。反证：本地用同一个 token 直接
+          # git push 改 .github/workflows/* 是成功的。
+          persist-credentials: false
 
       - name: Resolve push token
         env:
@@ -66,11 +71,9 @@ jobs:
           GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
         run: |
           set -euo pipefail
-          # 关键：提交身份必须是 token 对应的那个「人」。GitHub 判断能不能动
-          # .github/workflows/* 看的是提交者身份，不是推送用的 token —— 只要
-          # author/committer 是 bot（如 github-actions[bot]），就按 GitHub App 对待，
-          # 照样报 "refusing to allow a GitHub App to create or update workflow"，
-          # 哪怕这一条 push 用的是带 workflow scope 的 PAT。实测踩过。
+          # 合并提交落在 token 对应的真人名下：这是发版归属的正确写法，也让
+          # 「谁跟的版」在 git log 里对得上。注意它不是上一条推送失败的原因
+          # （那次是 checkout 的 extraHeader 把 GITHUB_TOKEN 塞进了认证，见上）。
           LOGIN=$(gh api user --jq .login)
           NOREPLY=$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')
           echo "PUSH_LOGIN=$LOGIN" >> "$GITHUB_ENV"
