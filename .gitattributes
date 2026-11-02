@@ -7,6 +7,19 @@
 # 属性一旦写死，检出与规范化就与各人的 autocrlf 设置无关。
 *.js   text eol=lf
 
+# fpk 的 cmd/* 是无扩展名 shell 脚本，飞牛上由 bash 直接执行；一旦检出成 CRLF，
+# `#!/bin/bash\r` 会让整个应用起不来。同理 Dockerfile 里那句 sed 去 \r 也说明
+# *.sh 在本仓库一直是 CRLF 风险面。打包素材一律钉死 LF，二进制素材钉死 binary。
+*.sh              text eol=lf
+fpk/**/cmd/*      text eol=lf
+fpk/**/manifest   text eol=lf
+fpk/**/wizard/*   text eol=lf
+fpk/**/config/*   text eol=lf
+fpk/**/app/ui/config text eol=lf
+*.fpk             binary
+*.png             binary
+*.PNG             binary
+
 # 本文件自身也钉成 LF：否则 core.autocrlf=true 的机器下次检出会把它写成 CRLF，
 # 提交时反复刷出 "LF will be replaced by CRLF" 警告（规则本身不受影响，只是噪音）。
 .gitattributes text eol=lf

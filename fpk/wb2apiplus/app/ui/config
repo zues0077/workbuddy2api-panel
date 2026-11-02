@@ -1,0 +1,20 @@
+{
+  ".url": {
+    "wb2apiplus.Application": {
+      "noDisplay": false,
+      "allUsers": false,
+      "fileTypes": [],
+      "control": {
+        "accessPerm": "editable"
+      },
+      "protocol": "http",
+      "gatewayPrefix": "",
+      "gatewaySocket": "",
+      "title": "wb2api+",
+      "icon": "images/icon_{0}.png",
+      "type": "url",
+      "port": "${port}",
+      "url": "/panel"
+    }
+  }
+}

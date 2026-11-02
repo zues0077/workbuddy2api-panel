@@ -1,0 +1,16 @@
+appname=wb2apiplus
+version=${VERSION}
+display_name=wb2api+
+desc="""<p>🤖WorkBuddy2API 自托管 OpenAI 兼容反向代理网关（fork 版：跟紧上游 + 融合多平台能力）。不保证未来可用性与账户安全，介意勿用。</p><p>⭐默认面板：http://192.168.x.x:7863/panel，默认模型地址：http://127.0.0.1:7863/v1，面板密码和模型 key 为同一密码。</p>"""
+platform=${PLATFORM}
+source=thirdparty
+maintainer=misakano7545
+maintainer_url=https://github.com/misakano7545/workbuddy2api-panel
+distributor=zues0077
+distributor_url=https://github.com/zues0077/workbuddy2api-panel
+ctl_stop=true
+desktop_uidir=ui
+desktop_applaunchname=wb2apiplus.Application
+checkport=false
+disable_authorization_path=true
+changelog=${CHANGELOG}
