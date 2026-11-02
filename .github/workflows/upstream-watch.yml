@@ -61,6 +61,22 @@ jobs:
           fi
           echo "FOLLOW_PAT 已就位（用户身份推送，才能触发后续 binaries/docker/exe/fpk）"
 
+      - name: Resolve push identity
+        env:
+          GH_TOKEN: ${{ secrets.FOLLOW_PAT }}
+        run: |
+          set -euo pipefail
+          # 关键：提交身份必须是 token 对应的那个「人」。GitHub 判断能不能动
+          # .github/workflows/* 看的是提交者身份，不是推送用的 token —— 只要
+          # author/committer 是 bot（如 github-actions[bot]），就按 GitHub App 对待，
+          # 照样报 "refusing to allow a GitHub App to create or update workflow"，
+          # 哪怕这一条 push 用的是带 workflow scope 的 PAT。实测踩过。
+          LOGIN=$(gh api user --jq .login)
+          NOREPLY=$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')
+          echo "PUSH_LOGIN=$LOGIN" >> "$GITHUB_ENV"
+          echo "PUSH_EMAIL=$NOREPLY" >> "$GITHUB_ENV"
+          echo "合并提交将以 $LOGIN <$NOREPLY> 身份落库"
+
       - name: Fetch upstream
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,8 +131,10 @@ jobs:
           set -euo pipefail
           # 提交者身份要落到仓库配置：只写在单条命令的 -c 上，第二条 merge 命令
           # 拿不到身份，会报 "Committer identity unknown" 并直接失败。
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 身份用上面解析出的 token 对应用户，不能用 github-actions[bot]——bot 身份
+          # 会被按 GitHub App 对待，含工作文件改动的合并就推不上去（见 Resolve push identity）。
+          git config user.name "$PUSH_LOGIN"
+          git config user.email "$PUSH_EMAIL"
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "upstream/main 已全部包含在本地历史，无需合并"
             exit 0
