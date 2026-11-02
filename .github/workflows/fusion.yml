@@ -96,14 +96,26 @@ jobs:
             echo "手动 force，重打 $TAG"
             exit 0
           fi
-          # 幂等判据写在 Release 正文里（commit 链接含完整 sha），不额外维护状态文件：
-          # 少一个需要同步的持久状态，就少一种「状态说打过了但资产不见了」的扯皮。
+          # 幂等判据写在 Release 正文里（commit 链接含完整 sha），不额外维护状态文件。
+          # 但**正文对上不代表货齐**：Release 是 resolve job 先建的，build job 中途挂掉
+          # 会留下一个「sha 已记录、资产却缺件」的半成品。只按正文跳过，就会永远跳过
+          # 一条坏产物线 —— 所以再要求三样资产都在。
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.body // ""' 2>/dev/null || true)
-          if [[ -n "$BODY" && "$BODY" == *"$SHA"* ]]; then
+          VERSION="${{ steps.pick.outputs.version }}"
+          HAVE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          COMPLETE=true
+          for want in "$APP_NAME-$VERSION-x86.fpk" "$APP_NAME-$VERSION-arm.fpk" "workbuddy-api-$VERSION-win-amd64.exe"; do
+            grep -qx "$want" <<< "$HAVE" || COMPLETE=false
+          done
+          if [[ -n "$BODY" && "$BODY" == *"$SHA"* && "$COMPLETE" == "true" ]]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$TAG 已经是 commit ${SHA:0:7} 的产物，无需重打"
+            echo "::notice::$TAG 已经是 commit ${SHA:0:7} 的完整产物，无需重打"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            # 末尾不能是裸的 [[ … ]] && echo：set -e 下条件为假会让整个 step 退出码变 1。
+            if [[ -n "$BODY" && "$BODY" == *"$SHA"* ]]; then
+              echo "::warning::$TAG 正文已是该 commit，但资产不齐，重打"
+            fi
           fi
 
       # Release 先建好：两个架构 job 会并行上传资产，谁先跑到都得有地方传。
@@ -190,8 +202,9 @@ jobs:
           cd fusion-src
           # -H windowsgui 与上游 scripts/build_release.sh 一致：无控制台窗口，
           # 托盘由程序自己按 --no-tray 判定。少了这个 flag，双击就是黑框。
+          # 产物落工作区根目录（与 linux 二进制同处），后面的上传步骤按根目录路径找。
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w -H windowsgui" -o "workbuddy-api-${VERSION}-win-amd64.exe" ./cmd/workbuddy-api
+            go build -trimpath -ldflags="-s -w -H windowsgui" -o "../workbuddy-api-${VERSION}-win-amd64.exe" ./cmd/workbuddy-api
           cd ..
           sha256sum "workbuddy-api-${VERSION}-win-amd64.exe"
 
@@ -291,8 +304,10 @@ jobs:
             io.fusion.upstream=${{ env.FUSION_REPO }}
             io.fusion.upstream.sha=${{ env.UPSTREAM_SHA }}
           provenance: false
-          cache-from: type=gha,scope=fusion-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=fusion-${{ matrix.platform }}
+          # 不加 type=gha 缓存：runner 默认 buildx 是 docker driver，它**不支持缓存导出**
+          # （报 "Cache export is not supported for the docker driver"）。要用就得额外
+          # setup-buildx 起 docker-container driver，而这个镜像只是 alpine + 一个 COPY，
+          # 没有任何值得缓存的层 —— 删缓存比加 driver 便宜。
 
   manifest:
     needs: [resolve, build]
