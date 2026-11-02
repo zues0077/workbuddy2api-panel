@@ -30,7 +30,6 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
-	"github.com/misakano7545/workbuddy2api-panel/internal/qodercn"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
@@ -867,10 +866,6 @@ type Client struct {
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
 	globalModels fetchGlobalModelsCache
 
-	// qcn Qoder 中国版渠道委托（realm "qodercn"）；nil = 未装配（SetQoderCN，
-	// 见 qodercn_bridge.go）。WorkBuddy 账号路径完全不经此字段。
-	qcn *qodercn.Client
-
 	// KeepRecentRounds 只保留最近 N 轮对话（prompt.keep_recent_rounds，issue #99）；
 	// 0 = 关闭。热改由面板保存配置触发，见 payload.go trimHistory。
 	KeepRecentRounds atomic.Int64
@@ -1408,11 +1403,6 @@ func (c *Client) RefreshTokenIfNeeded(a *auth.Auth, within time.Duration) error 
 //
 // 锁序：refreshMu → a.mu；网络 I/O 不持任何锁。
 func (c *Client) refresh(a *auth.Auth, within time.Duration, force bool) error {
-	// qodercn 账号走自己的 drt- 轮换端点：refreshing/renewed 宽限表是 WorkBuddy
-	// RT 口径（refreshKey 取 JWT 形态），dt-/drt- 不套用，直接每次真刷。
-	if a.IsQoderCN() {
-		return c.qcnRefreshToken(a)
-	}
 	a.Lock()
 	rtSnapshot := a.RefreshToken
 	atBefore := a.AccessToken
@@ -1618,12 +1608,6 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 反证，删了无回滚路径）。
 // timing 为可选分段耗时出参（nil = 零开销、零行为变化）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta, timing *ChatTiming) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	// qodercn 渠道：协议（COSY 签名 / 嵌套 SSE / 网关域）与 WorkBuddy 无任何交集，
-	// prepareBody/会话头/chatPaths 那套改写全部不适用——在入口整体分流委托，
-	// 返回的流已是标准 OpenAI SSE（下游转写见 qodercn_bridge.go）。
-	if a.Realm() == auth.RealmQoderCN {
-		return c.qcnChatStreamContext(ctx, a, body)
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2908,13 +2892,6 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 // 把套餐型包的月度周期重置日当成了到期日（实测：cycle=2026-10-31，deduction=2034-12-24），
 // 首页快照因此长期错报最近到期时间与数量。
 func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
-	// qodercn 渠道：额度口径是 userQuota+addOnQuota（见 qodercn_bridge.go），
-	// 无 WorkBuddy 的资源包/到期批次体系，入口分流。
-	if a.IsQoderCN() {
-		remain, total, err = c.qcnUserResourceSnapshot(a)
-		c.notifyCredits(a, remain, err)
-		return remain, total, 0, time.Time{}, 0, nil, err
-	}
 	// 企业版与静态 API Key 的额度都不在「个人资源包」体系内：get-user-resource*
 	// 对 enterpriseId 非空账号恒返回空 Accounts（实测 code 0 且 Accounts null），
 	// 对 ck_/pt_ 静态 Key 同样（它没有个人账号身份）。判据收在
@@ -3126,11 +3103,6 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	// qodercn campaigns 签到：与 WorkBuddy daily-checkin 无关（幂等语义在桥接层
-	// 对齐「已签到」文本判定），不做 5xx 重试（campaigns 领取本身有当日窗口重试）。
-	if a.IsQoderCN() {
-		return c.qcnCheckin(a)
-	}
 	return c.retryBillingTransient(func() error {
 		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
 		return err

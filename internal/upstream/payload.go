@@ -34,13 +34,13 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 }
 
 // SplitRealmPrefix 解析网关的 realm 前缀协议（"[realm:]model"）：
-// 取第一个 ":"，前段恰为 "cn"/"global"/"qodercn" 才剥离；否则视为裸名，realm 回落 "cn"。
+// 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm 回落 "cn"。
 // 大小写敏感（前缀必须是精确的小写枚举）。server.resolveModel 委托本函数，
 // 保证选号、粘性、出站重写三处口径一致。
 func SplitRealmPrefix(model string) (realm, bare string) {
 	if i := strings.IndexByte(model, ':'); i >= 0 {
 		switch model[:i] {
-		case "cn", "global", "qodercn":
+		case "cn", "global":
 			return model[:i], model[i+1:]
 		}
 	}

@@ -9,9 +9,6 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false;
 let logPin = true, loginState = null, loginTimer = null, loginStartAt = 0;
-// loginPollPath 轮询端点随登录站点切换：WorkBuddy 走 login/poll，Qoder 中国版走
-// qodercn/login/poll（PKCE 设备流，见后端 login_qodercn.go）。
-let loginPollPath = 'login/poll';
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -492,16 +489,14 @@ function renderAccounts(list) {
   const tb = $('accBody');
   const total = lastAccountsList.length;
   const globalCnt = lastAccountsList.filter(s => s.realm === 'global').length;
-  const qcnCnt = lastAccountsList.filter(s => s.realm === 'qodercn').length;
-  const cnCnt = total - globalCnt - qcnCnt;
+  const cnCnt = total - globalCnt;
 
   const elTabs = $('accRealmTabs');
   if (elTabs) {
-    const cAll = $('accCntAll'), cCn = $('accCntCn'), cGl = $('accCntGlobal'), cQc = $('accCntQodercn');
+    const cAll = $('accCntAll'), cCn = $('accCntCn'), cGl = $('accCntGlobal');
     if (cAll) cAll.textContent = total;
     if (cCn) cCn.textContent = cnCnt;
     if (cGl) cGl.textContent = globalCnt;
-    if (cQc) cQc.textContent = qcnCnt;
     elTabs.querySelectorAll('button[data-realm]').forEach(b => {
       b.classList.toggle('on', b.dataset.realm === accRealmFilter);
     });
@@ -509,22 +504,18 @@ function renderAccounts(list) {
 
   let filtered = lastAccountsList;
   if (accRealmFilter === 'cn') {
-    filtered = lastAccountsList.filter(s => s.realm !== 'global' && s.realm !== 'qodercn');
+    filtered = lastAccountsList.filter(s => s.realm !== 'global');
   } else if (accRealmFilter === 'global') {
     filtered = lastAccountsList.filter(s => s.realm === 'global');
-  } else if (accRealmFilter === 'qodercn') {
-    filtered = lastAccountsList.filter(s => s.realm === 'qodercn');
   }
 
   if (!filtered.length) {
     if (!total) {
       setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
     } else if (accRealmFilter === 'cn') {
-      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国内版账号</div>当前账号池内均为国际版/Qoder 账号（共 ' + (total - cnCnt) + ' 个）</div></td></tr>');
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国内版账号</div>当前账号池内均为国际版账号（共 ' + globalCnt + ' 个）</div></td></tr>');
     } else if (accRealmFilter === 'global') {
-      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国际版账号</div>当前账号池内均为国内版/Qoder 账号（共 ' + (total - globalCnt) + ' 个）</div></td></tr>');
-    } else if (accRealmFilter === 'qodercn') {
-      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无 Qoder 账号</div>通过「添加账号 → Qoder 中国版」登录后自动入池（共 ' + (total - qcnCnt) + ' 个其它账号）</div></td></tr>');
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国际版账号</div>当前账号池内均为国内版账号（共 ' + cnCnt + ' 个）</div></td></tr>');
     }
     return;
   }
@@ -594,9 +585,6 @@ function renderAccounts(list) {
     // 无个人成长体系的账号（企业版 / 静态 API Key）：签到与成长任务端点在上游对自己
     // 恒失败，按钮点了只会报错，故不渲染；「额度」按钮走企业口径端点照常可用。
     const personal = !(s.enterprise || s.api_key);
-    // Qoder 账号有签到（campaigns）但无成长任务体系：checkin 沿用 personal 槽，
-    // tasks 对它隐藏（后端任务端点按 WorkBuddy 成长体系设计）。
-    const qcnAcct = s.realm === 'qodercn';
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -607,7 +595,6 @@ function renderAccounts(list) {
     const rawWho = s.nickname || s.uid || '';
     const nameHtml = remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
     const tags = (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') +
-      (s.realm === 'qodercn' ? ' <span class="realm-tag">Qoder</span>' : '') +
       (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
       (s.api_key ? ' <span class="realm-tag">API Key</span>' : '');
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
@@ -634,7 +621,7 @@ function renderAccounts(list) {
         (personal ?
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' : ''),
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>',
-        ((personal && !qcnAcct) ?
+        (personal ?
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : ''),
         (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>'
                 : (anyFrozen ? '' : null)),
@@ -683,7 +670,7 @@ function renderModelLocks(rows) {
       esc(alt) + '">⤳ 已路由至 ' + esc(alt) + '</div>' : '';
     return '<tr>' +
       '<td><b>' + esc(r.model) + '</b>' + route + '</td>' +
-      '<td>' + (r.realm === 'global' ? '国际版' : r.realm === 'qodercn' ? 'Qoder' : '国内版') + '</td>' +
+      '<td>' + (r.realm === 'global' ? '国际版' : '国内版') + '</td>' +
       '<td><span class="tag ' + cls + '">' + label + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
       '<td class="num">' + (r.locked || 0) + '</td>' +
@@ -1941,13 +1928,9 @@ function startAddLogin() {
   // 站点（官方域表 cn/intl/workbuddy）：面板只传 site，realm 由后端按站点表决定，
   // 避免前端自己维护一份域表。
   const site = (document.querySelector('input[name="addSite"]:checked') || {}).value || 'cn';
-  // Qoder 中国版是独立的设备流后端（PKCE + 轮询 deviceToken/poll），与 WorkBuddy
-  // 的 auth/state 三端点流程不同：start/poll 各走各的路径。
-  const qcnSite = site === 'qodercn';
-  loginPollPath = qcnSite ? 'qodercn/login/poll' : 'login/poll';
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
-  api(qcnSite ? 'qodercn/login/start' : 'login/start', { method: 'POST', body: JSON.stringify(qcnSite ? {} : { site }) }).then(r => {
+  api('login/start', { method: 'POST', body: JSON.stringify({ site }) }).then(r => {
     loginState = r.state;
     loginStartAt = Date.now();
     $('addUrl').textContent = r.url;
@@ -1986,7 +1969,7 @@ const POLL_MAX_FAILS = 20;
 async function pollLogin() {
   if (!loginState) return;
   try {
-    const r = await api(loginPollPath + '?state=' + encodeURIComponent(loginState));
+    const r = await api('login/poll?state=' + encodeURIComponent(loginState));
     pollFails = 0;
     if (r.fatal) {
       // 上游许可类终态（席位满 / 许可证过期 / 试用到期）：重试无意义，直接把上游
@@ -2002,7 +1985,7 @@ async function pollLogin() {
       $('addReady').hidden = true;
       $('addDone').hidden = false;
       const warn = r.balance_error ? '；但余额校验失败：' + r.balance_error + '（若持续 401，请在浏览器退出腾讯账号后重登）' : '';
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : r.realm === 'qodercn' ? '（Qoder 中国版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
+      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
       invalidatePackages(); // 凭据换新：缓存里的旧 401 行必须作废
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }

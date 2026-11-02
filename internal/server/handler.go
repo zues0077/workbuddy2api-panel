@@ -720,38 +720,6 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
-	// qodercn（Qoder 中国版）模型名单：渠道装配且池内有可用号时列出（"qodercn:" 前缀）。
-	// 纯动态（渠道无静态表，失败回落「上次成功缓存」在 qodercn 包内）：无号 → 空名单。
-	// 字段只给上游显式下发的（context/max_output/能力旗标），不编造 models.dev 形状。
-	if h.cfg.Upstream.QoderCNEnabled() {
-		if acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "qodercn"); acct != nil {
-			if infos, err := h.cfg.Upstream.FetchQoderCNModels(acct); err == nil {
-				for _, mi := range infos {
-					if !h.allowedModel("qodercn", mi.ID) || h.hiddenModel("qodercn", mi.ID) {
-						continue
-					}
-					entry := map[string]any{
-						"id":       "qodercn:" + mi.ID,
-						"object":   "model",
-						"created":  1753600000,
-						"owned_by": "qoder",
-					}
-					if mi.ContextWindow > 0 {
-						entry["context_length"] = mi.ContextWindow
-					}
-					if mi.MaxTokens > 0 {
-						entry["max_output_tokens"] = mi.MaxTokens
-					}
-					if mi.SupportsReasoning {
-						entry["reasoning_supported"] = true
-					}
-					out = append(out, entry)
-				}
-			} else {
-				log.Printf("WARN: [server] qodercn models fetch failed: %v", err)
-			}
-		}
-	}
 	// 出图模型（目录里被 tag 剔掉的 text-to-image / image-to-image）：对话列表照旧不含它们，
 	// 这里以 image_generation=true 单列——客户端据此发现可用的出图模型名，不会误发对话。
 	out = append(out, h.generationModelEntries()...)

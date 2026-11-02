@@ -29,7 +29,6 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
-	"github.com/misakano7545/workbuddy2api-panel/internal/qodercn"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
@@ -127,13 +126,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	// qodercn 渠道凭据（qodercn-*.json）与 WorkBuddy 同目录、同名空间：加载失败只
-	// 告警不阻塞启动（WorkBuddy 账号照常）。
-	qcnAuths, err := auth.LoadQoderCNDir(cfg.AuthDir)
-	if err != nil {
-		log.Printf("load qodercn auths: %v", err)
-	}
-	auths = append(auths, qcnAuths...)
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
@@ -280,13 +272,6 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	applyCNChatBase(up, cfg)
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
-	// qodercn 渠道客户端（realm=auth.RealmQoderCN 分流，见 upstream.qodercn_bridge）：
-	// 短 RPC 上限对齐 upstream.HTTP；SSE 走无总时长的 StreamHTTP + 空闲监控，不受此值影响。
-	qcn := qodercn.NewWithTimeout(time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second)
-	up.SetQoderCN(qcn)
-	if len(qcnAuths) > 0 {
-		log.Printf("[qodercn] 渠道已启用（%d 个账号）", len(qcnAuths))
-	}
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。

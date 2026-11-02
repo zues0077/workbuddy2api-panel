@@ -58,10 +58,6 @@ type Snapshot struct {
 //     所以别名可以跨域指向："my-glm" → "global:glm-5.2" 合法）。
 //   - 无 "="、空键、空值、键==值（大小写不敏感）→ 丢弃（自我映射还可能成环）。
 //   - 同一键后写条目覆盖先写条目（配置里重复定义以最后一条为准，与 map 字面量一致）。
-// isRealmPrefix 合法域前缀集合（internal/upstream.SplitRealmPrefix 的镜像清单）：
-// "cn"/"global"/"qodercn"。三处 Normalize* 共用，避免前缀枚举漂移。
-func isRealmPrefix(p string) bool { return p == "cn" || p == "global" || p == "qodercn" }
-
 func NormalizeModelAliases(in []string) map[string]string {
 	if len(in) == 0 {
 		return nil
@@ -77,13 +73,11 @@ func NormalizeModelAliases(in []string) map[string]string {
 		if k == "" || v == "" || strings.EqualFold(k, v) {
 			continue
 		}
-		if prefix, bare, cut := strings.Cut(k, ":"); cut && isRealmPrefix(prefix) {
+		if prefix, bare, cut := strings.Cut(k, ":"); cut && (prefix == "cn" || prefix == "global") {
 			out[prefix+":"+bare] = v
 		} else {
-			// 裸名三域都生效（qodercn 与 cn/global 同为 SplitRealmPrefix 认可的前缀）。
 			out["cn:"+k] = v
 			out["global:"+k] = v
-			out["qodercn:"+k] = v
 		}
 	}
 	if len(out) == 0 {
@@ -133,12 +127,11 @@ func NormalizeHiddenModels(hidden []string) map[string]struct{} {
 		if m == "" {
 			continue
 		}
-		if prefix, bare, ok := strings.Cut(m, ":"); ok && isRealmPrefix(prefix) {
+		if prefix, bare, ok := strings.Cut(m, ":"); ok && (prefix == "cn" || prefix == "global") {
 			out[prefix+":"+bare] = struct{}{}
 		} else {
 			out["cn:"+m] = struct{}{}
 			out["global:"+m] = struct{}{}
-			out["qodercn:"+m] = struct{}{}
 		}
 	}
 	if len(out) == 0 {
@@ -163,12 +156,11 @@ func NormalizeAllowedModels(in []string) (map[string]struct{}, bool) {
 		if m == "" {
 			continue
 		}
-		if prefix, bare, ok := strings.Cut(m, ":"); ok && isRealmPrefix(prefix) {
+		if prefix, bare, ok := strings.Cut(m, ":"); ok && (prefix == "cn" || prefix == "global") {
 			out[prefix+":"+bare] = struct{}{}
 		} else {
 			out["cn:"+m] = struct{}{}
 			out["global:"+m] = struct{}{}
-			out["qodercn:"+m] = struct{}{}
 		}
 	}
 	if len(out) == 0 {
